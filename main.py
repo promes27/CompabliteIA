@@ -1,0 +1,212 @@
+import os
+import re
+import cv2
+import fitz
+import pandas as pd
+import easyocr
+import streamlit as st
+from pdf2image import convert_from_path
+import google.generativeai as genai
+from io import StringIO
+
+# ==========================
+# CONFIGURATION
+# ==========================
+CSV_OUTPUT = "brouillard_complet.csv"
+API_KEY = "VOTRE_CLE_API"
+PDF_PCG = "D:/OCR/plan-comptable-general-2005.pdf"
+
+reader = easyocr.Reader(['fr', 'en'], gpu=False)
+genai.configure(api_key=API_KEY)
+model = genai.GenerativeModel('gemini-2.0-flash')
+
+# ==========================
+# CHARGEMENT PCG
+# ==========================
+def charger_classes_1_a_7_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    texte_total = ""
+    for page in doc:
+        texte_total += page.get_text()
+    lignes = texte_total.split('\n')
+    paragraphe_classe = []
+    garder = False
+    for ligne in lignes:
+        texte = ligne.strip()
+        if re.match(r"^CLASSE\s+1", texte, re.IGNORECASE):
+            garder = True
+        elif re.match(r"^CLASSE\s+8", texte, re.IGNORECASE):
+            garder = False
+        if garder and texte:
+            paragraphe_classe.append(texte)
+    return "\n".join(paragraphe_classe)
+
+pcg_contenu = charger_classes_1_a_7_pdf(PDF_PCG)
+
+# ==========================
+# FONCTIONS UTILITAIRES
+# ==========================
+def preprocess_image(image_path):
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    _, img_bin = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return img_bin
+
+def nettoyer_montant(text):
+    try:
+        text = re.sub(r'(?<=\d)O(?=\d)', '0', text)
+        montant = text.replace(" ", "").replace(",", ".")
+        montant = re.sub(r"[^\d.]", "", montant)
+        return float(montant) if montant else 0.0
+    except:
+        return 0.0
+
+def extraire_champs(texte):
+    date_regex = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', texte)
+    date_extrait = date_regex[0] if date_regex else ''
+    num_facture = re.findall(r'FACTURE\s*(?:No|N°|#)?\s*([\w\-]+)', texte, flags=re.IGNORECASE)
+    num_facture = num_facture[0] if num_facture else ''
+    montant_ht = re.findall(r'Total\s*HT\s*[:\-]?\s*([\d\s.,]+)', texte, flags=re.IGNORECASE)
+    montant_tva = re.findall(r'TVA\s*\(.*?\)\s*[:\-]?\s*([\d\s.,]+)', texte, flags=re.IGNORECASE)
+    montant_ttc = re.findall(r'Total\s*TTC\s*[:\-]?\s*([\d\s.,]+)', texte, flags=re.IGNORECASE)
+    ht = nettoyer_montant(montant_ht[0]) if montant_ht else 0.0
+    tva = nettoyer_montant(montant_tva[0]) if montant_tva else 0.0
+    ttc = nettoyer_montant(montant_ttc[0]) if montant_ttc else 0.0
+    if abs(ttc - (ht + tva)) > 1000 and ht > 0 and tva > 0:
+        ttc = ht + tva
+    return {
+        'date': date_extrait,
+        'numero_piece': num_facture,
+        'montant_ht': ht,
+        'tva': tva,
+        'montant_ttc': ttc
+    }
+
+def classifier_avec_gemini(texte_brut):
+    prompt = f"""
+Tu es un expert en comptabilité. Indique le type de journal comptable (achat, vente, banque, caisse, OD) :
+\"\"\"{texte_brut}\"\"\"
+Réponds uniquement par le type.
+"""
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip().lower()
+    except:
+        return "inconnu"
+
+def detecter_compte(texte_ocr, contenu_pcg):
+    prompt = f"""
+Tu es expert du PCG malgache 2005.
+Texte :
+\"\"\"{texte_ocr}\"\"\"
+PCG (classes 1 à 7) :
+\"\"\"{contenu_pcg[:12000]}\"\"\"
+Quel compte le plus approprié ? Réponds uniquement par un numéro.
+"""
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip().split()[0]
+    except:
+        return "000"
+
+def generer_journal_avec_llm(texte_ocr, contenu_pcg):
+    prompt = f"""
+Génère l'écriture comptable au format :
+
+Date | Numéro de compte | Libellé | Débit | Crédit
+Texte :
+\"\"\"{texte_ocr}\"\"\"
+PCG :
+\"\"\"{contenu_pcg[:12000]}\"\"\"
+"""
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except:
+        return ""
+
+# ==========================
+# TRAITEMENT AVEC TABLEAU
+# ==========================
+def traiter_image(image_path, pcg_contenu):
+    st.markdown(f"### Traitement : {os.path.basename(image_path)}")
+    img = preprocess_image(image_path)
+    result = reader.readtext(img)
+    texte_complet = " ".join([text for _, text, _ in result])
+    st.text("Texte OCR extrait :")
+    st.write(texte_complet)
+
+    champs = extraire_champs(texte_complet)
+    champs['texte_brut'] = texte_complet
+    champs['fichier'] = os.path.basename(image_path)
+    champs['type_journal'] = classifier_avec_gemini(texte_complet)
+    champs['compte'] = detecter_compte(texte_complet, pcg_contenu)
+    journal_md = generer_journal_avec_llm(texte_complet, pcg_contenu)
+
+    # Convertir le Markdown en DataFrame pour affichage
+    try:
+        table_csv = re.sub(r'\|', ',', journal_md)
+        table_csv = re.sub(r'\n+', '\n', table_csv)
+        df_journal = pd.read_csv(StringIO(table_csv), skiprows=1)
+    except:
+        df_journal = pd.DataFrame([["Erreur conversion Markdown"]])
+
+    st.markdown("**Journal comptable généré :**")
+    st.dataframe(df_journal)
+
+    return champs
+
+# ==========================
+# INTERFACE STREAMLIT
+# ==========================
+st.markdown('<h2 style="color: green; font-size:20px; text-align: center;">Automatisation des Processus Comptables</h2>', unsafe_allow_html=True)
+
+fichiers = st.file_uploader("", type=["png","jpg","jpeg","pdf","csv","xlsx"], accept_multiple_files=True)
+
+if st.button("Traiter") and fichiers:
+    donnees = []
+
+    for fichier in fichiers:
+        extension = os.path.splitext(fichier.name)[1].lower()
+        temp_path = "temp_" + fichier.name
+        with open(temp_path, "wb") as f:
+            f.write(fichier.read())
+
+        if extension in [".png",".jpg",".jpeg"]:
+            donnees.append(traiter_image(temp_path, pcg_contenu))
+        elif extension == ".pdf":
+            doc = fitz.open(temp_path)
+            texte_total = "".join([page.get_text() for page in doc])
+            if texte_total.strip():
+                champs = extraire_champs(texte_total)
+                champs['texte_brut'] = texte_total
+                champs['fichier'] = os.path.basename(temp_path)
+                champs['type_journal'] = classifier_avec_gemini(texte_total)
+                champs['compte'] = detecter_compte(texte_total, pcg_contenu)
+                champs['journal_markdown'] = generer_journal_avec_llm(texte_total, pcg_contenu)
+                donnees.append(champs)
+            else:
+                pages = convert_from_path(temp_path)
+                for i, page in enumerate(pages):
+                    img_path = f"temp_page_{i}.png"
+                    page.save(img_path,"PNG")
+                    donnees.append(traiter_image(img_path, pcg_contenu))
+                    os.remove(img_path)
+        elif extension == ".xlsx":
+            df = pd.read_excel(temp_path)
+            donnees.extend(df.to_dict(orient="records"))
+        elif extension == ".csv":
+            df = pd.read_csv(temp_path)
+            donnees.extend(df.to_dict(orient="records"))
+
+        os.remove(temp_path)
+
+    if donnees:
+        df_final = pd.DataFrame(donnees)
+        df_final.to_csv(CSV_OUTPUT,index=False,encoding="utf-8-sig")
+        st.success(f"✅ Extraction terminée, exporté dans {CSV_OUTPUT}")
+        st.dataframe(df_final)
+        st.download_button("⬇️ Télécharger le CSV", data=df_final.to_csv(index=False, encoding="utf-8-sig"), file_name=CSV_OUTPUT, mime="text/csv")
+
+
+
+
