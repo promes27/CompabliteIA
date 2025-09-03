@@ -6,9 +6,10 @@ import pandas as pd
 import easyocr
 import streamlit as st
 from pdf2image import convert_from_path
-import google.generativeai as genai
 from io import StringIO
-
+from rapidfuzz import fuzz
+import spacy
+from openai import OpenAI
 # ==========================
 # CONFIGURATION
 # ==========================
@@ -17,9 +18,10 @@ API_KEY = "VOTRE_CLE_API"
 PDF_PCG = "D:/OCR/plan-comptable-general-2005.pdf"
 
 reader = easyocr.Reader(['fr', 'en'], gpu=False)
-genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash')
-
+# genai.configure(api_key=API_KEY)
+# model = genai.GenerativeModel('gemini-2.0-flash')
+client = OpenAI(api_key=API_KEY)
+nlp = spacy.load("fr_core_news_sm")
 # ==========================
 # CHARGEMENT PCG
 # ==========================
@@ -81,48 +83,115 @@ def extraire_champs(texte):
         'montant_ttc': ttc
     }
 
-def classifier_avec_gemini(texte_brut):
+def detecter_doublons(df, seuil_similarite=85):
+    alertes = []
+    for i, row in df.iterrows():
+        doublon = False
+        for j in range(i):
+            autre = df.iloc[j]
+            # Cas 1 : doublon strict (date + numéro + montant identiques)
+            if (
+                row["date"] == autre["date"] and
+                row["numero_piece"] == autre["numero_piece"] and
+                row["montant"] == autre["montant"]
+            ):
+                doublon = True
+                break
+            # Cas 2 : doublon flou (texte OCR très similaire)
+            similarite = fuzz.token_sort_ratio(row["texte_brut"], autre["texte_brut"])
+            if similarite >= seuil_similarite:
+                doublon = True
+                break
+        alertes.append("Doublon détecté" if doublon else "Non")
+    df["alerte_doublon"] = alertes
+    return df
+
+def classifier_avec_gpt(texte_brut):
     prompt = f"""
-Tu es un expert en comptabilité. Indique le type de journal comptable (achat, vente, banque, caisse, OD) :
+Tu es un expert en comptabilité. En te basant sur le texte suivant extrait d'une pièce comptable, indique de quel type de journal comptable il s'agit (achat, vente, banque, caisse, OD).
+
+Texte de la pièce :
 \"\"\"{texte_brut}\"\"\"
-Réponds uniquement par le type.
+
+Répond uniquement par le type de journal.
 """
     try:
-        response = model.generate_content(prompt)
-        return response.text.strip().lower()
-    except:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content.strip().lower()
+    except Exception as e:
+        print("Erreur GPT :", e)
         return "inconnu"
 
 def detecter_compte(texte_ocr, contenu_pcg):
     prompt = f"""
-Tu es expert du PCG malgache 2005.
-Texte :
+Tu es un expert du Plan Comptable Général malgache 2005.
+
+Voici un texte extrait d'une pièce comptable :
 \"\"\"{texte_ocr}\"\"\"
-PCG (classes 1 à 7) :
+
+Voici un extrait du PCG (classes 1 à 7) :
 \"\"\"{contenu_pcg[:12000]}\"\"\"
-Quel compte le plus approprié ? Réponds uniquement par un numéro.
+
+Quel est le numéro de compte le plus approprié selon le PCG ?
+Réponds uniquement par un numéro (exemple : 606).
 """
     try:
-        response = model.generate_content(prompt)
-        return response.text.strip().split()[0]
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content.strip().split()[0]
     except:
         return "000"
 
-def generer_journal_avec_llm(texte_ocr, contenu_pcg):
+def generer_journal_avec_llm(texte_ocr, pcg_contenu, journal_csv="grand_journal.csv"):
     prompt = f"""
-Génère l'écriture comptable au format :
+Tu es un expert en comptabilité basé sur le Plan Comptable Général malgache 2005.
+
+Voici une pièce comptable scannée :
+\"\"\"{texte_ocr}\"\"\" 
+
+Voici le plan comptable (extrait classes 1 à 7) :
+\"\"\"{pcg_contenu[:12000]}\"\"\"
+
+Génère l'écriture comptable correspondante au format suivant (journal à 5 colonnes) :
 
 Date | Numéro de compte | Libellé | Débit | Crédit
-Texte :
-\"\"\"{texte_ocr}\"\"\"
-PCG :
-\"\"\"{contenu_pcg[:12000]}\"\"\"
+
+Réponds uniquement avec un tableau propre.
 """
     try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except:
-        return ""
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        texte_tableau = response.choices[0].message.content.strip()
+
+        lignes = texte_tableau.split("\n")
+        lignes = [l for l in lignes if "|" in l and "---" not in l]
+
+        colonnes = ["Date", "Numéro de compte", "Libellé", "Débit (Ar)", "Crédit (Ar)"]
+        donnees_corrigees = []
+
+        for l in lignes:
+            c = [x.strip() for x in l.split("|")[1:-1]]
+            while len(c) < len(colonnes):
+                c.append("")
+            c = c[:len(colonnes)]
+            donnees_corrigees.append(c)
+
+        df_journal = pd.DataFrame(donnees_corrigees, columns=colonnes)
+        df_journal.to_csv(journal_csv, index=False, encoding="utf-8-sig")
+        st.write(f"✅ Journal sauvegardé dans {journal_csv}")
+
+        return df_journal
+
+    except Exception as e:
+        st.write("Erreur journal GPT :", e)
+        return pd.DataFrame()
 
 # ==========================
 # TRAITEMENT AVEC TABLEAU
@@ -138,20 +207,21 @@ def traiter_image(image_path, pcg_contenu):
     champs = extraire_champs(texte_complet)
     champs['texte_brut'] = texte_complet
     champs['fichier'] = os.path.basename(image_path)
-    champs['type_journal'] = classifier_avec_gemini(texte_complet)
+    champs['type_journal'] = classifier_avec_gpt(texte_complet)
     champs['compte'] = detecter_compte(texte_complet, pcg_contenu)
-    journal_md = generer_journal_avec_llm(texte_complet, pcg_contenu)
+    champs['journal_markdown'] = generer_journal_avec_llm(texte_complet, pcg_contenu)
+    # journal_md = generer_journal_avec_llm(texte_complet, pcg_contenu)
 
-    # Convertir le Markdown en DataFrame pour affichage
-    try:
-        table_csv = re.sub(r'\|', ',', journal_md)
-        table_csv = re.sub(r'\n+', '\n', table_csv)
-        df_journal = pd.read_csv(StringIO(table_csv), skiprows=1)
-    except:
-        df_journal = pd.DataFrame([["Erreur conversion Markdown"]])
+    # # Convertir le Markdown en DataFrame pour affichage
+    # try:
+    #     table_csv = re.sub(r'\|', ',', journal_md)
+    #     table_csv = re.sub(r'\n+', '\n', table_csv)
+    #     df_journal = pd.read_csv(StringIO(table_csv), skiprows=1)
+    # except:
+    #     df_journal = pd.DataFrame([["Erreur conversion Markdown"]])
 
-    st.markdown("**Journal comptable généré :**")
-    st.dataframe(df_journal)
+    # st.markdown("**Journal comptable généré :**")
+    # st.dataframe(df_journal)
 
     return champs
 
@@ -180,7 +250,7 @@ if st.button("Traiter") and fichiers:
                 champs = extraire_champs(texte_total)
                 champs['texte_brut'] = texte_total
                 champs['fichier'] = os.path.basename(temp_path)
-                champs['type_journal'] = classifier_avec_gemini(texte_total)
+                champs['type_journal'] = classifier_avec_gpt(texte_total)
                 champs['compte'] = detecter_compte(texte_total, pcg_contenu)
                 champs['journal_markdown'] = generer_journal_avec_llm(texte_total, pcg_contenu)
                 donnees.append(champs)
@@ -201,10 +271,12 @@ if st.button("Traiter") and fichiers:
         os.remove(temp_path)
 
     if donnees:
+        df = pd.DataFrame(donnees)
+        df = detecter_doublons(df, seuil_similarite=85)
         df_final = pd.DataFrame(donnees)
         df_final.to_csv(CSV_OUTPUT,index=False,encoding="utf-8-sig")
         st.success(f"✅ Extraction terminée, exporté dans {CSV_OUTPUT}")
-        st.dataframe(df_final)
+        st.dataframe(df)
         st.download_button("⬇️ Télécharger le CSV", data=df_final.to_csv(index=False, encoding="utf-8-sig"), file_name=CSV_OUTPUT, mime="text/csv")
 
 
