@@ -185,7 +185,7 @@ Réponds uniquement avec un tableau propre.
 
         df_journal = pd.DataFrame(donnees_corrigees, columns=colonnes)
         df_journal.to_csv(journal_csv, index=False, encoding="utf-8-sig")
-        st.write(f"✅ Journal sauvegardé dans {journal_csv}")
+        st.write(df_journal)
 
         return df_journal
 
