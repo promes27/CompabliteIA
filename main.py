@@ -10,18 +10,32 @@ from io import StringIO
 from rapidfuzz import fuzz
 import spacy
 from openai import OpenAI
+
+from dotenv import load_dotenv   # <<--- AJOUT
+
+# Charger .env
+load_dotenv()
+
 # ==========================
 # CONFIGURATION
 # ==========================
 CSV_OUTPUT = "brouillard_complet.csv"
-API_KEY = "VOTRE_CLE_API"
-PDF_PCG = "D:/OCR/plan-comptable-general-2005.pdf"
+PDF_PCG = "D:/OCR/CompabliteIA/plan-comptable-general-2005.pdf"
 
+# Lecture OCR
 reader = easyocr.Reader(['fr', 'en'], gpu=False)
-# genai.configure(api_key=API_KEY)
-# model = genai.GenerativeModel('gemini-2.0-flash')
-client = OpenAI(api_key=API_KEY)
+
+# Initialisation OpenAI via variable d'environnement
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    st.error("❌ La clé OpenAI n'est pas définie. Veuillez créer la variable d'environnement OPENAI_API_KEY.")
+    st.stop()
+
+client = OpenAI(api_key=api_key)
+
+# Modèle NLP pour français
 nlp = spacy.load("fr_core_news_sm")
+
 # ==========================
 # CHARGEMENT PCG
 # ==========================
@@ -89,16 +103,14 @@ def detecter_doublons(df, seuil_similarite=85):
         doublon = False
         for j in range(i):
             autre = df.iloc[j]
-            # Cas 1 : doublon strict (date + numéro + montant identiques)
             if (
-                row["date"] == autre["date"] and
-                row["numero_piece"] == autre["numero_piece"] and
-                row["montant"] == autre["montant"]
+                row.get("date") == autre.get("date") and
+                row.get("numero_piece") == autre.get("numero_piece") and
+                row.get("montant_ttc") == autre.get("montant_ttc")
             ):
                 doublon = True
                 break
-            # Cas 2 : doublon flou (texte OCR très similaire)
-            similarite = fuzz.token_sort_ratio(row["texte_brut"], autre["texte_brut"])
+            similarite = fuzz.token_sort_ratio(row.get("texte_brut",""), autre.get("texte_brut",""))
             if similarite >= seuil_similarite:
                 doublon = True
                 break
@@ -111,7 +123,7 @@ def classifier_avec_gpt(texte_brut):
 Tu es un expert en comptabilité. En te basant sur le texte suivant extrait d'une pièce comptable, indique de quel type de journal comptable il s'agit (achat, vente, banque, caisse, OD).
 
 Texte de la pièce :
-\"\"\"{texte_brut}\"\"\"
+\"\"\"{texte_brut}\"\"\" 
 
 Répond uniquement par le type de journal.
 """
@@ -122,7 +134,7 @@ Répond uniquement par le type de journal.
         )
         return response.choices[0].message.content.strip().lower()
     except Exception as e:
-        print("Erreur GPT :", e)
+        st.warning(f"Erreur GPT : {e}")
         return "inconnu"
 
 def detecter_compte(texte_ocr, contenu_pcg):
@@ -130,10 +142,10 @@ def detecter_compte(texte_ocr, contenu_pcg):
 Tu es un expert du Plan Comptable Général malgache 2005.
 
 Voici un texte extrait d'une pièce comptable :
-\"\"\"{texte_ocr}\"\"\"
+\"\"\"{texte_ocr}\"\"\" 
 
 Voici un extrait du PCG (classes 1 à 7) :
-\"\"\"{contenu_pcg[:12000]}\"\"\"
+\"\"\"{contenu_pcg[:12000]}\"\"\" 
 
 Quel est le numéro de compte le plus approprié selon le PCG ?
 Réponds uniquement par un numéro (exemple : 606).
@@ -155,7 +167,7 @@ Voici une pièce comptable scannée :
 \"\"\"{texte_ocr}\"\"\" 
 
 Voici le plan comptable (extrait classes 1 à 7) :
-\"\"\"{pcg_contenu[:12000]}\"\"\"
+\"\"\"{pcg_contenu[:12000]}\"\"\" 
 
 Génère l'écriture comptable correspondante au format suivant (journal à 5 colonnes) :
 
@@ -170,9 +182,7 @@ Réponds uniquement avec un tableau propre.
         )
         texte_tableau = response.choices[0].message.content.strip()
 
-        lignes = texte_tableau.split("\n")
-        lignes = [l for l in lignes if "|" in l and "---" not in l]
-
+        lignes = [l for l in texte_tableau.split("\n") if "|" in l and "---" not in l]
         colonnes = ["Date", "Numéro de compte", "Libellé", "Débit (Ar)", "Crédit (Ar)"]
         donnees_corrigees = []
 
@@ -188,14 +198,10 @@ Réponds uniquement avec un tableau propre.
         st.write(f"✅ Journal sauvegardé dans {journal_csv}")
 
         return df_journal
-
     except Exception as e:
-        st.write("Erreur journal GPT :", e)
+        st.warning(f"Erreur journal GPT : {e}")
         return pd.DataFrame()
 
-# ==========================
-# TRAITEMENT AVEC TABLEAU
-# ==========================
 def traiter_image(image_path, pcg_contenu):
     st.markdown(f"### Traitement : {os.path.basename(image_path)}")
     img = preprocess_image(image_path)
@@ -210,19 +216,6 @@ def traiter_image(image_path, pcg_contenu):
     champs['type_journal'] = classifier_avec_gpt(texte_complet)
     champs['compte'] = detecter_compte(texte_complet, pcg_contenu)
     champs['journal_markdown'] = generer_journal_avec_llm(texte_complet, pcg_contenu)
-    # journal_md = generer_journal_avec_llm(texte_complet, pcg_contenu)
-
-    # # Convertir le Markdown en DataFrame pour affichage
-    # try:
-    #     table_csv = re.sub(r'\|', ',', journal_md)
-    #     table_csv = re.sub(r'\n+', '\n', table_csv)
-    #     df_journal = pd.read_csv(StringIO(table_csv), skiprows=1)
-    # except:
-    #     df_journal = pd.DataFrame([["Erreur conversion Markdown"]])
-
-    # st.markdown("**Journal comptable généré :**")
-    # st.dataframe(df_journal)
-
     return champs
 
 # ==========================
@@ -230,7 +223,7 @@ def traiter_image(image_path, pcg_contenu):
 # ==========================
 st.markdown('<h2 style="color: green; font-size:20px; text-align: center;">Automatisation des Processus Comptables</h2>', unsafe_allow_html=True)
 
-fichiers = st.file_uploader("", type=["png","jpg","jpeg","pdf","csv","xlsx"], accept_multiple_files=True)
+fichiers = st.file_uploader("Upload fichiers (images, PDF, CSV, Excel)", type=["png","jpg","jpeg","pdf","csv","xlsx"], accept_multiple_files=True)
 
 if st.button("Traiter") and fichiers:
     donnees = []
@@ -278,6 +271,7 @@ if st.button("Traiter") and fichiers:
         st.success(f"✅ Extraction terminée, exporté dans {CSV_OUTPUT}")
         st.dataframe(df)
         st.download_button("⬇️ Télécharger le CSV", data=df_final.to_csv(index=False, encoding="utf-8-sig"), file_name=CSV_OUTPUT, mime="text/csv")
+
 
 
 
