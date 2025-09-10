@@ -281,130 +281,41 @@ def aggreger_en_grand_journal(donnees, fichier_sortie="grand_journal.csv"):
     grand_journal.to_csv(fichier_sortie,index=False,encoding="utf-8-sig")
     return grand_journal
 
+# ==========================
+# LETTRAGE AUTOMATIQUE
+# ==========================
+def lettrer_factures_paiements(df_journal):
+    df = df_journal.copy()
+    df['Lettrage'] = ''
+    df['Écart'] = 0.0
+    df['Statut'] = 'Non lettré'
 
+    # Convertir les colonnes Débit et Crédit en float
+    df['Débit (Ar)'] = pd.to_numeric(df['Débit (Ar)'], errors='coerce').fillna(0.0)
+    df['Crédit (Ar)'] = pd.to_numeric(df['Crédit (Ar)'], errors='coerce').fillna(0.0)
 
-def generer_grand_livre(df_grand_journal, fichier_sortie="grand_livre.csv"):
-    """
-    Génère le Grand Livre à partir du Grand Journal.
-    """
-    if df_grand_journal.empty:
-        return pd.DataFrame()
+    factures = df[df['Type journal'].isin(['vente','achat'])].copy()
+    paiements = df[df['Type journal'].isin(['banque','caisse'])].copy()
 
-    # Nettoyer les colonnes Débit et Crédit pour enlever "Ar" et espaces
-    for col in ["Débit (Ar)", "Crédit (Ar)"]:
-        df_grand_journal[col] = (
-            df_grand_journal[col]
-            .astype(str)
-            .str.replace(r"[^\d.,-]", "", regex=True)  # garder que chiffres
-            .str.replace(",", ".", regex=False)        # remplacer , par .
-        )
-        df_grand_journal[col] = pd.to_numeric(df_grand_journal[col], errors="coerce").fillna(0)
+    for idx_f, facture in factures.iterrows():
+        ref = facture['Référence']
+        montant = facture['Débit (Ar)'] if facture['Débit (Ar)'] > 0 else facture['Crédit (Ar)']
 
-    # Liste des comptes uniques
-    comptes = df_grand_journal["Numéro de compte"].unique()
-    grand_livre = []
-
-    for compte in comptes:
-        df_compte = df_grand_journal[df_grand_journal["Numéro de compte"] == compte].copy()
-        df_compte = df_compte.sort_values(by="Date").reset_index(drop=True)
-        # Calcul du solde cumulé
-        df_compte["Solde"] = (df_compte["Débit (Ar)"] - df_compte["Crédit (Ar)"]).cumsum()
-        df_compte["Compte"] = compte
-        grand_livre.append(df_compte)
-
-    df_grand_livre = pd.concat(grand_livre, ignore_index=True)
-    colonnes = ["Compte","Date","Référence","Libellé","Débit (Ar)","Crédit (Ar)","Solde"]
-    df_grand_livre = df_grand_livre.reindex(columns=colonnes)
-
-    # ✅ Version affichage formatée (ex : "200 000 Ar")
-    for col in ["Débit (Ar)", "Crédit (Ar)", "Solde"]:
-        df_grand_livre[col] = df_grand_livre[col].apply(lambda x: f"{int(x):,} Ar".replace(",", " ") if x != 0 else "")
-
-    # Export CSV (avec nombres bruts pour analyse)
-    df_export = pd.concat(grand_livre, ignore_index=True)
-    df_export = df_export.reindex(columns=colonnes)
-    df_export.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
-
-    return df_grand_livre
-
-# def lettrage_automatique(df_grand_livre, tolerance=1000):
-#     """
-#     Lettrage automatisé factures <-> paiements
-#     - df_grand_livre : DataFrame avec ['Compte','Date','Référence','Libellé','Débit (Ar)','Crédit (Ar)']
-#     - tolerance : écart accepté en Ariary
-#     """
-#     # Nettoyage des montants
-#     for col in ["Débit (Ar)", "Crédit (Ar)"]:
-#         df_grand_livre[col] = (
-#             df_grand_livre[col]
-#             .astype(str)
-#             .str.replace(r"[^\d.,-]", "", regex=True)
-#             .str.replace(",", ".", regex=False)
-#         )
-#         df_grand_livre[col] = pd.to_numeric(df_grand_livre[col], errors="coerce").fillna(0)
-
-#     # Conversion des dates
-#     df_grand_livre["Date"] = pd.to_datetime(df_grand_livre["Date"], errors="coerce", dayfirst=True)
-
-#     # Identifier factures (débit) et paiements (crédit)
-#     factures = df_grand_livre[df_grand_livre["Débit (Ar)"] > 0].copy()
-#     factures["Montant Facture"] = factures["Débit (Ar)"]
-
-#     paiements = df_grand_livre[df_grand_livre["Crédit (Ar)"] > 0].copy()
-#     paiements["Montant Paiement"] = paiements["Crédit (Ar)"]
-
-#     resultats = []
-
-#     for i, fac in factures.iterrows():
-#         montant_f = fac["Montant Facture"]
-#         date_f = fac["Date"]
-
-#         # Chercher paiements compatibles
-#         candidats = paiements[
-#             (paiements["Montant Paiement"].between(montant_f - tolerance, montant_f + tolerance)) &
-#             (paiements["Date"] >= date_f)
-#         ]
-
-#         if not candidats.empty:
-#             paiement = candidats.iloc[0]
-#             ecart = paiement["Montant Paiement"] - montant_f
-#             if ecart == 0:
-#                 statut = "✅ Soldée"
-#             elif ecart < 0:
-#                 statut = "⚠️ Partielle"
-#             else:
-#                 statut = "➕ Trop perçu"
-
-#             resultats.append({
-#                 "Compte": fac["Compte"],
-#                 "Référence": fac["Référence"],
-#                 "Date Facture": fac["Date"].date(),
-#                 "Montant Facture": montant_f,
-#                 "Date Paiement": paiement["Date"].date(),
-#                 "Montant Payé": paiement["Montant Paiement"],
-#                 "Statut": statut,
-#                 "Ecart": ecart
-#             })
-
-#             # Retirer ce paiement pour éviter double appariement
-#             paiements = paiements.drop(paiement.name)
-
-#         else:
-#             # Pas de paiement trouvé
-#             resultats.append({
-#                 "Compte": fac["Compte"],
-#                 "Référence": fac["Référence"],
-#                 "Date Facture": fac["Date"].date(),
-#                 "Montant Facture": montant_f,
-#                 "Date Paiement": None,
-#                 "Montant Payé": 0,
-#                 "Statut": "❌ Impayée",
-#                 "Ecart": -montant_f
-#             })
-
-#     return pd.DataFrame(resultats)
-
-
+        paiements_possibles = paiements[
+            (paiements['Référence'] == ref) |
+            (abs(paiements['Débit (Ar)'] - montant) < 1) |
+            (abs(paiements['Crédit (Ar)'] - montant) < 1)
+        ]
+        if not paiements_possibles.empty:
+            paiement = paiements_possibles.iloc[0]
+            df.at[idx_f, 'Lettrage'] = f"{ref}"
+            ecart = montant - (paiement['Débit (Ar)'] + paiement['Crédit (Ar)'])
+            df.at[idx_f, 'Écart'] = ecart
+            df.at[idx_f, 'Statut'] = 'Lettré' if abs(ecart) < 1 else 'Écart'
+            paiements = paiements.drop(paiements_possibles.index[0])
+        else:
+            df.at[idx_f, 'Statut'] = 'Non lettré'
+    return df
 # ==========================
 # INTERFACE STREAMLIT
 # ==========================
