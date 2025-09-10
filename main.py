@@ -252,6 +252,21 @@ def lettrer_factures_paiements(df_journal):
     df['Débit (Ar)'] = pd.to_numeric(df['Débit (Ar)'], errors='coerce').fillna(0.0)
     df['Crédit (Ar)'] = pd.to_numeric(df['Crédit (Ar)'], errors='coerce').fillna(0.0)
 
+    # Regrouper par référence (même facture / même pièce)
+    grouped = df.groupby("Référence")
+
+    for ref, group in grouped:
+        total_debit = group["Débit (Ar)"].sum()
+        total_credit = group["Crédit (Ar)"].sum()
+        ecart = total_debit - total_credit
+
+        # Cas 1 : facture équilibrée (ex : ventes + TVA vs compte client)
+        if abs(ecart) < 1:
+            df.loc[group.index, "Lettrage"] = f"{ref}"
+            df.loc[group.index, "Écart"] = 0.0
+            df.loc[group.index, "Statut"] = "Lettré"
+
+    # Cas 2 : associer facture ↔ paiement
     factures = df[df['Type journal'].isin(['vente','achat'])].copy()
     paiements = df[df['Type journal'].isin(['banque','caisse'])].copy()
 
@@ -266,13 +281,18 @@ def lettrer_factures_paiements(df_journal):
         ]
         if not paiements_possibles.empty:
             paiement = paiements_possibles.iloc[0]
-            df.at[idx_f, 'Lettrage'] = f"{ref}"
             ecart = montant - (paiement['Débit (Ar)'] + paiement['Crédit (Ar)'])
+
+            df.at[idx_f, 'Lettrage'] = f"{ref}"
             df.at[idx_f, 'Écart'] = ecart
             df.at[idx_f, 'Statut'] = 'Lettré' if abs(ecart) < 1 else 'Écart'
-            paiements = paiements.drop(paiements_possibles.index[0])
-        else:
-            df.at[idx_f, 'Statut'] = 'Non lettré'
+
+            df.at[paiement.name, 'Lettrage'] = f"{ref}"
+            df.at[paiement.name, 'Écart'] = ecart
+            df.at[paiement.name, 'Statut'] = 'Lettré' if abs(ecart) < 1 else 'Écart'
+
+            paiements = paiements.drop(paiement.name)
+
     return df
 # ==========================
 # INTERFACE STREAMLIT
