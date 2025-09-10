@@ -78,7 +78,7 @@ def extraire_champs(texte):
         except:
             pass
 
-    num_facture = re.findall(r'FACTURE\s*(?:N°|N["\'%]?)\s*([^\s]+)', texte, flags=re.IGNORECASE)
+    num_facture = re.findall(r'(?:FACTURE|facture)?\s*(?:N°|N["\'%]?)?\s*([0-9]{4}-[0-9]+)', texte)
     num_facture = num_facture[0] if num_facture else ''
 
     montant_ht = re.findall(r'Total\s*HT\s*[:\-]?\s*([\d\s.,]+)', texte, flags=re.IGNORECASE)
@@ -122,21 +122,48 @@ def detecter_doublons(df, seuil_similarite=85):
     return df
 
 def classifier_avec_gpt(texte_brut):
-    prompt = f"""
-Tu es un expert en comptabilité. Indique de quel type de journal comptable il s'agit (achat, vente, banque, caisse, OD).
+    """
+    Classe une pièce comptable en type de journal : achat, vente, banque, caisse, OD.
+    Utilise GPT avec un prompt plus précis et valide la réponse.
+    """
+    # Nettoyage du texte OCR pour réduire le bruit
+    texte_propre = re.sub(r'\s+', ' ', texte_brut)  # supprimer les sauts de ligne multiples
+    texte_propre = re.sub(r'[^a-zA-Z0-9 /.,\-]', '', texte_propre)  # garder caractères utiles
 
-Texte :
-\"\"\"{texte_brut}\"\"\" 
-Répond uniquement par le type de journal.
+    prompt = f"""
+Tu es un expert en comptabilité malgache selon le PCG 2005. 
+Tu dois classer une pièce comptable selon son type exact. 
+Les types possibles sont : 
+- achat
+- vente
+- banque
+- caisse
+- OD (opérations diverses)
+
+Ignore les mots trompeurs et base-toi sur le contexte réel de la pièce 
+(client ou fournisseur, paiement reçu ou effectué, type de document, etc.)
+
+Texte de la pièce comptable (nettoyé) :
+\"\"\"{texte_propre}\"\"\" 
+
+Répond uniquement par un mot exact parmi : achat, vente, banque, caisse, OD
 """
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}]
         )
-        return response.choices[0].message.content.strip().lower()
-    except:
+        type_journal = response.choices[0].message.content.strip().lower()
+
+        # Validation stricte : si GPT renvoie autre chose, on met "inconnu"
+        if type_journal not in ["achat", "vente", "banque", "caisse", "od"]:
+            type_journal = "inconnu"
+        return type_journal
+
+    except Exception as e:
+        print(f"Erreur classifier_avec_gpt : {e}")
         return "inconnu"
+
 
 def detecter_compte(texte_ocr, contenu_pcg):
     prompt = f"""
@@ -233,47 +260,151 @@ def aggreger_en_grand_journal(donnees, fichier_sortie="grand_journal.csv"):
     colonnes = ["Date","Référence","Numéro de compte","Libellé","Débit (Ar)","Crédit (Ar)","Type journal"]
     grand_journal = grand_journal.reindex(columns=colonnes)
     
+    # Nettoyer les colonnes Débit et Crédit (enlever "Ar", espaces, etc.)
+    for col in ["Débit (Ar)", "Crédit (Ar)"]:
+        grand_journal[col] = (
+            grand_journal[col]
+            .astype(str)
+            .str.replace(r"[^\d.,-]", "", regex=True)  # garder seulement chiffres
+            .str.replace(",", ".", regex=False)        # remplacer , par .
+        )
+        grand_journal[col] = pd.to_numeric(grand_journal[col], errors="coerce").fillna(0)
+
+    # Normaliser les dates
     grand_journal["Date"] = pd.to_datetime(grand_journal["Date"], errors="coerce", dayfirst=True).dt.date
+    
+    # Trier par date
     grand_journal = grand_journal.sort_values(by="Date").reset_index(drop=True)
     grand_journal.index = grand_journal.index + 1
+    
+    # Export CSV
     grand_journal.to_csv(fichier_sortie,index=False,encoding="utf-8-sig")
     return grand_journal
 
-# ==========================
-# LETTRAGE AUTOMATIQUE
-# ==========================
-def lettrer_factures_paiements(df_journal):
-    df = df_journal.copy()
-    df['Lettrage'] = ''
-    df['Écart'] = 0.0
-    df['Statut'] = 'Non lettré'
 
-    # Convertir les colonnes Débit et Crédit en float
-    df['Débit (Ar)'] = pd.to_numeric(df['Débit (Ar)'], errors='coerce').fillna(0.0)
-    df['Crédit (Ar)'] = pd.to_numeric(df['Crédit (Ar)'], errors='coerce').fillna(0.0)
 
-    factures = df[df['Type journal'].isin(['vente','achat'])].copy()
-    paiements = df[df['Type journal'].isin(['banque','caisse'])].copy()
+def generer_grand_livre(df_grand_journal, fichier_sortie="grand_livre.csv"):
+    """
+    Génère le Grand Livre à partir du Grand Journal.
+    """
+    if df_grand_journal.empty:
+        return pd.DataFrame()
 
-    for idx_f, facture in factures.iterrows():
-        ref = facture['Référence']
-        montant = facture['Débit (Ar)'] if facture['Débit (Ar)'] > 0 else facture['Crédit (Ar)']
+    # Nettoyer les colonnes Débit et Crédit pour enlever "Ar" et espaces
+    for col in ["Débit (Ar)", "Crédit (Ar)"]:
+        df_grand_journal[col] = (
+            df_grand_journal[col]
+            .astype(str)
+            .str.replace(r"[^\d.,-]", "", regex=True)  # garder que chiffres
+            .str.replace(",", ".", regex=False)        # remplacer , par .
+        )
+        df_grand_journal[col] = pd.to_numeric(df_grand_journal[col], errors="coerce").fillna(0)
 
-        paiements_possibles = paiements[
-            (paiements['Référence'] == ref) |
-            (abs(paiements['Débit (Ar)'] - montant) < 1) |
-            (abs(paiements['Crédit (Ar)'] - montant) < 1)
-        ]
-        if not paiements_possibles.empty:
-            paiement = paiements_possibles.iloc[0]
-            df.at[idx_f, 'Lettrage'] = f"{ref}"
-            ecart = montant - (paiement['Débit (Ar)'] + paiement['Crédit (Ar)'])
-            df.at[idx_f, 'Écart'] = ecart
-            df.at[idx_f, 'Statut'] = 'Lettré' if abs(ecart) < 1 else 'Écart'
-            paiements = paiements.drop(paiements_possibles.index[0])
-        else:
-            df.at[idx_f, 'Statut'] = 'Non lettré'
-    return df
+    # Liste des comptes uniques
+    comptes = df_grand_journal["Numéro de compte"].unique()
+    grand_livre = []
+
+    for compte in comptes:
+        df_compte = df_grand_journal[df_grand_journal["Numéro de compte"] == compte].copy()
+        df_compte = df_compte.sort_values(by="Date").reset_index(drop=True)
+        # Calcul du solde cumulé
+        df_compte["Solde"] = (df_compte["Débit (Ar)"] - df_compte["Crédit (Ar)"]).cumsum()
+        df_compte["Compte"] = compte
+        grand_livre.append(df_compte)
+
+    df_grand_livre = pd.concat(grand_livre, ignore_index=True)
+    colonnes = ["Compte","Date","Référence","Libellé","Débit (Ar)","Crédit (Ar)","Solde"]
+    df_grand_livre = df_grand_livre.reindex(columns=colonnes)
+
+    # ✅ Version affichage formatée (ex : "200 000 Ar")
+    for col in ["Débit (Ar)", "Crédit (Ar)", "Solde"]:
+        df_grand_livre[col] = df_grand_livre[col].apply(lambda x: f"{int(x):,} Ar".replace(",", " ") if x != 0 else "")
+
+    # Export CSV (avec nombres bruts pour analyse)
+    df_export = pd.concat(grand_livre, ignore_index=True)
+    df_export = df_export.reindex(columns=colonnes)
+    df_export.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+
+    return df_grand_livre
+
+# def lettrage_automatique(df_grand_livre, tolerance=1000):
+#     """
+#     Lettrage automatisé factures <-> paiements
+#     - df_grand_livre : DataFrame avec ['Compte','Date','Référence','Libellé','Débit (Ar)','Crédit (Ar)']
+#     - tolerance : écart accepté en Ariary
+#     """
+#     # Nettoyage des montants
+#     for col in ["Débit (Ar)", "Crédit (Ar)"]:
+#         df_grand_livre[col] = (
+#             df_grand_livre[col]
+#             .astype(str)
+#             .str.replace(r"[^\d.,-]", "", regex=True)
+#             .str.replace(",", ".", regex=False)
+#         )
+#         df_grand_livre[col] = pd.to_numeric(df_grand_livre[col], errors="coerce").fillna(0)
+
+#     # Conversion des dates
+#     df_grand_livre["Date"] = pd.to_datetime(df_grand_livre["Date"], errors="coerce", dayfirst=True)
+
+#     # Identifier factures (débit) et paiements (crédit)
+#     factures = df_grand_livre[df_grand_livre["Débit (Ar)"] > 0].copy()
+#     factures["Montant Facture"] = factures["Débit (Ar)"]
+
+#     paiements = df_grand_livre[df_grand_livre["Crédit (Ar)"] > 0].copy()
+#     paiements["Montant Paiement"] = paiements["Crédit (Ar)"]
+
+#     resultats = []
+
+#     for i, fac in factures.iterrows():
+#         montant_f = fac["Montant Facture"]
+#         date_f = fac["Date"]
+
+#         # Chercher paiements compatibles
+#         candidats = paiements[
+#             (paiements["Montant Paiement"].between(montant_f - tolerance, montant_f + tolerance)) &
+#             (paiements["Date"] >= date_f)
+#         ]
+
+#         if not candidats.empty:
+#             paiement = candidats.iloc[0]
+#             ecart = paiement["Montant Paiement"] - montant_f
+#             if ecart == 0:
+#                 statut = "✅ Soldée"
+#             elif ecart < 0:
+#                 statut = "⚠️ Partielle"
+#             else:
+#                 statut = "➕ Trop perçu"
+
+#             resultats.append({
+#                 "Compte": fac["Compte"],
+#                 "Référence": fac["Référence"],
+#                 "Date Facture": fac["Date"].date(),
+#                 "Montant Facture": montant_f,
+#                 "Date Paiement": paiement["Date"].date(),
+#                 "Montant Payé": paiement["Montant Paiement"],
+#                 "Statut": statut,
+#                 "Ecart": ecart
+#             })
+
+#             # Retirer ce paiement pour éviter double appariement
+#             paiements = paiements.drop(paiement.name)
+
+#         else:
+#             # Pas de paiement trouvé
+#             resultats.append({
+#                 "Compte": fac["Compte"],
+#                 "Référence": fac["Référence"],
+#                 "Date Facture": fac["Date"].date(),
+#                 "Montant Facture": montant_f,
+#                 "Date Paiement": None,
+#                 "Montant Payé": 0,
+#                 "Statut": "❌ Impayée",
+#                 "Ecart": -montant_f
+#             })
+
+#     return pd.DataFrame(resultats)
+
+
 # ==========================
 # INTERFACE STREAMLIT
 # ==========================
@@ -337,15 +468,44 @@ if st.button("Traiter") and fichiers:
             mime="text/csv"
         )
 
-        # ==========================
-        # LETTRAGE
-        # ==========================
-        st.markdown("# Lettrage automatisé des factures et paiements")
-        df_lettrage = lettrer_factures_paiements(df_final)
-        st.dataframe(df_lettrage)
+        st.markdown("# Grand Livre")
+        df_grand_livre = generer_grand_livre(df_final, "grand_livre.csv")
+        st.dataframe(df_grand_livre)
         st.download_button(
-            "⬇️ Télécharger le Grand Journal lettré",
-            data=df_lettrage.to_csv(index=False, encoding="utf-8-sig"),
-            file_name="grand_journal_lettré.csv",
+            "⬇️ Télécharger le Grand Livre",
+            data=df_grand_livre.to_csv(index=False, encoding="utf-8-sig"),
+            file_name="grand_livre.csv",
             mime="text/csv"
         )
+
+    # if not df_final.empty:
+    #     st.markdown("## Lettrage automatisé Factures ↔ Paiements")
+    #     df_lettrage = lettrage_automatique(df_grand_livre, tolerance=1000)
+    
+    # if not df_lettrage.empty:
+    #     # Coloration selon statut
+    #     def color_statut(val):
+    #         if val == "✅ Soldée":
+    #             color = 'background-color: #d4edda'  # vert clair
+    #         elif val == "⚠️ Partielle":
+    #             color = 'background-color: #fff3cd'  # jaune
+    #         elif val == "➕ Trop perçu":
+    #             color = 'background-color: #cce5ff'  # bleu clair
+    #         elif val == "❌ Impayée":
+    #             color = 'background-color: #f8d7da'  # rouge clair
+    #         else:
+    #             color = ''
+    #         return color
+        
+    #     st.dataframe(df_lettrage.style.applymap(color_statut, subset=['Statut']))
+        
+    #     st.download_button(
+    #         "⬇️ Télécharger le lettrage",
+    #         data=df_lettrage.to_csv(index=False, encoding="utf-8-sig"),
+    #         file_name="lettrage_factures.csv",
+    #         mime="text/csv"
+    #     )
+    # else:
+    #     st.info("Aucun lettrage à afficher.")
+
+
