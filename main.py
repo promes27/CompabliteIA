@@ -23,7 +23,7 @@ import numpy as np
 
 load_dotenv()
 CSV_OUTPUT = "grand_journal.csv"
-PDF_PCG = "D:/OCR/CompabliteIA/plan-comptable-general-2005.pdf"
+PDF_PCG = "./plan-comptable-general-2005.pdf"
 
 # OCR et NLP
 reader = easyocr.Reader(['fr', 'en'], gpu=False)
