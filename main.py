@@ -20,9 +20,6 @@ import numpy as np
 # CONFIGURATION
 # ==========================
 
-if not st.session_state.get("authenticated", False):
-    st.warning("⚠️ Veuillez vous connecter d'abord.")
-    st.stop()
 
 load_dotenv()
 CSV_OUTPUT = "grand_journal.csv"

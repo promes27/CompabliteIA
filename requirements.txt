@@ -16,6 +16,7 @@ confection==0.1.5
 cymem==2.0.11
 distro==1.9.0
 Django==5.2.4
+dotenv==0.9.9
 easyocr==1.7.2
 filelock==3.18.0
 fr_core_news_sm @ https://github.com/explosion/spacy-models/releases/download/fr_core_news_sm-3.8.0/fr_core_news_sm-3.8.0-py3-none-any.whl#sha256=7d6ad14cd5078e53147bfbf70fb9d433c6a3865b695fda2657140bbc59a27e29
@@ -77,9 +78,12 @@ pydeck==0.9.1
 Pygments==2.19.2
 PyMuPDF==1.26.3
 pyparsing==3.2.3
+pytesseract==0.3.13
 python-bidi==0.6.6
 python-dateutil==2.9.0.post0
+python-decouple==3.8
 python-docx==1.2.0
+python-dotenv==1.1.1
 pytz==2025.2
 PyYAML==6.0.2
 RapidFuzz==3.14.0
