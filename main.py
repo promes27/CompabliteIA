@@ -1,3 +1,4 @@
+
 import os
 import re
 import cv2
@@ -10,10 +11,17 @@ from rapidfuzz import fuzz
 import spacy
 from openai import OpenAI
 from dotenv import load_dotenv
+from collections import deque
+from PIL import Image
+import io
+import numpy as np
 
 # ==========================
 # CONFIGURATION
 # ==========================
+
+
+
 load_dotenv()
 CSV_OUTPUT = "grand_journal.csv"
 PDF_PCG = "D:/OCR/CompabliteIA/plan-comptable-general-2005.pdf"
@@ -28,6 +36,15 @@ if not api_key:
     st.error("❌ La clé OpenAI n'est pas définie. Créez OPENAI_API_KEY dans .env")
     st.stop()
 client = OpenAI(api_key=api_key)
+
+# ==========================
+# INITIALISATION DE L'ÉTAT
+# ==========================
+if 'df_final' not in st.session_state:
+    st.session_state.df_final = pd.DataFrame()
+
+if 'df_modifie' not in st.session_state:
+    st.session_state.df_modifie = pd.DataFrame()
 
 # ==========================
 # CHARGEMENT PCG
@@ -146,7 +163,7 @@ Ignore les mots trompeurs et base-toi sur le contexte réel de la pièce
 Texte de la pièce comptable (nettoyé) :
 \"\"\"{texte_propre}\"\"\" 
 
-Répond uniquement par un mot exact parmi : achat, vente, banque, caisse, OD
+Réponds uniquement par un mot exact parmi : achat, vente, banque, caisse, OD
 """
     try:
         response = client.chat.completions.create(
@@ -164,20 +181,22 @@ Répond uniquement par un mot exact parmi : achat, vente, banque, caisse, OD
         print(f"Erreur classifier_avec_gpt : {e}")
         return "inconnu"
 
-
-def detecter_compte(texte_ocr, contenu_pcg):
+def detecter_compte(texte_ocr, contenu_pcg, client=None):
     prompt = f"""
-Tu es un expert du Plan Comptable Général malgache 2005.
+    Tu es un expert du Plan Comptable Général malgache 2005.
 
-Texte extrait :
-\"\"\"{texte_ocr}\"\"\" 
+    Texte extrait :
+    \"\"\"{texte_ocr}\"\"\"
 
-Extrait PCG (classes 1 à 7) :
-\"\"\"{contenu_pcg[:12000]}\"\"\" 
+    Client/Fournisseur :
+    \"\"\"{client}\"\"\"
 
-Quel est le numéro de compte le plus approprié ?
-Réponds uniquement par un numéro.
-"""
+    Extrait PCG (classes 1 à 7) :
+    \"\"\"{contenu_pcg[:12000]}\"\"\"
+
+    Quel est le numéro de compte le plus approprié ?
+    Réponds uniquement par un numéro.
+    """
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -187,16 +206,26 @@ Réponds uniquement par un numéro.
     except:
         return "000"
 
-def generer_journal_avec_llm(texte_ocr, pcg_contenu):
+
+def generer_journal_avec_llm(texte_ocr, pcg_contenu, type_journal="vente"):
     prompt = f"""
-Tu es un expert comptable selon le PCG 2005.
+Tu es un expert comptable selon le PCG 2005 Madagascar.
 
-Pièce :
-\"\"\"{texte_ocr}\"\"\" 
+Voici une pièce comptable :
+\"\"\"{texte_ocr}\"\"\"
 
-Génère un tableau avec 5 colonnes : Date, Numéro de compte, Libellé, Débit, Crédit
-- La colonne Date doit contenir uniquement la date au format JJ/MM/AAAA
-- Ne répète pas les en-têtes
+Consignes :
+- Si c’est une **vente** :
+  - Utiliser 411 pour le client (jamais 512 Banque dans le journal de vente).
+  - Utiliser 70x pour les ventes et 44571 pour la TVA collectée.
+- Si c’est un **achat** :
+  - Utiliser 401 pour le fournisseur (jamais 512 Banque).
+  - Utiliser 60x pour les charges et 44566 pour la TVA déductible.
+- Si c’est une opération de **banque** :
+  - Utiliser 512 (banque) avec contrepartie 411 (client) ou 401 (fournisseur).
+- Le montant TTC doit être équilibré entre débits et crédits.
+- Donne un tableau avec 5 colonnes : Date, Numéro de compte, Libellé, Débit, Crédit.
+- La Date doit être au format JJ/MM/AAAA.
 """
     try:
         response = client.chat.completions.create(
@@ -216,15 +245,46 @@ Génère un tableau avec 5 colonnes : Date, Numéro de compte, Libellé, Débit,
             donnees_corrigees.append(c)
         
         df_journal = pd.DataFrame(donnees_corrigees, columns=colonnes)
+        
+        # Nettoyage
         if len(df_journal) > 0:
             premiere_ligne = df_journal.iloc[0]
             mots_cles = ['date','compte','libellé','libelle','débit','debit','crédit','credit']
             if any(mot in " ".join(str(v).lower() for v in premiere_ligne.values) for mot in mots_cles):
                 df_journal = df_journal.drop(0).reset_index(drop=True)
+
         df_journal = df_journal.dropna(how='all').reset_index(drop=True)
         df_journal.index = df_journal.index + 1
+        
         if "Date" in df_journal.columns:
             df_journal["Date"] = pd.to_datetime(df_journal["Date"], errors="coerce", dayfirst=True).dt.date
+
+        # Vérification métier
+        comptes_autorises = {
+                "achat": [
+                    "401","403","404","408","409",
+                    "601","602","606","607","608","609",
+                    "44562","44566"
+                ],
+                "vente": [
+                    "411","413","418","419",
+                    "701","702","703","706","707","708","709",
+                    "44571"
+                ],
+                "banque": [
+                    "512","514","401","411","421","431","445","581"
+                ],
+                "caisse": [
+                    "53","401","411","512"
+                ]
+        }
+
+        comptes_ok = comptes_autorises.get(type_journal, [])
+        for idx, row in df_journal.iterrows():
+            compte = str(row["Numéro de compte"])
+            if not any(compte.startswith(c) for c in comptes_ok):
+                df_journal.at[idx, "Numéro de compte"] = "???"
+
         return df_journal
     except:
         return pd.DataFrame()
@@ -242,7 +302,7 @@ def traiter_image(image_path, pcg_contenu):
     champs['fichier'] = os.path.basename(image_path)
     champs['type_journal'] = classifier_avec_gpt(texte_complet)
     champs['compte'] = detecter_compte(texte_complet, pcg_contenu)
-    champs['journal_markdown'] = generer_journal_avec_llm(texte_complet, pcg_contenu)
+    champs['journal_markdown'] = generer_journal_avec_llm(texte_complet, pcg_contenu, champs['type_journal'])
     return champs
 
 def aggreger_en_grand_journal(donnees, fichier_sortie="grand_journal.csv"):
@@ -325,192 +385,241 @@ def generer_grand_livre(df_grand_journal, fichier_sortie="grand_livre.csv"):
 
     return df_grand_livre
 
-
-def ocr_releve_bancaire(fichier):
+def generer_lettrage(df_grand_journal, fichier_sortie="lettrage.csv"):
     """
-    Extrait un relevé bancaire via OCR (PDF ou image).
-    Retourne un DataFrame avec colonnes Date, Libellé, Montant
+    Rapproche débits/crédits par compte (lettrage).
+    - supporte lettrage exact et partiel (fractionnement logique).
+    - retourne un dataframe avec colonnes: Numéro de compte, Date, Référence, Libellé,
+      Débit (Ar), Crédit (Ar), Solde partiel, Statut, Lettrage
     """
-    texte_total = ""
-    extension = os.path.splitext(fichier)[1].lower()
+    if df_grand_journal is None or df_grand_journal.empty:
+        return pd.DataFrame()
 
-    if extension == ".pdf":
-        doc = fitz.open(fichier)
-        for page in doc:
-            texte_total += page.get_text()
-    else:  # image (png, jpg, jpeg)
-        img = preprocess_image(fichier)
-        result = reader.readtext(img)
-        texte_total = " ".join([text for _, text, _ in result])
+    df = df_grand_journal.copy()
 
-    # Extraction des dates et montants
-    lignes = texte_total.split("\n")
-    donnees = []
-    for ligne in lignes:
-        date_match = re.search(r"\b\d{2}/\d{2}/\d{4}\b", ligne)
-        montant_match = re.search(r"[-+]?\d[\d\s.,]*", ligne)
-        if date_match and montant_match:
-            date_op = pd.to_datetime(date_match.group(), dayfirst=True, errors="coerce").date()
-            montant = nettoyer_montant(montant_match.group())
-            libelle = ligne.replace(date_match.group(), "").replace(montant_match.group(), "").strip()
-            donnees.append({"Date": date_op, "Libellé": libelle, "Montant": montant})
-
-    return pd.DataFrame(donnees)
-
-
-def rapprochement_bancaire(df_grand_journal, fichier_releve, seuil_jours=3):
-    """
-    Compare les écritures du compte 512 Banque avec le relevé bancaire (CSV ou OCR).
-    """
-    extension = os.path.splitext(fichier_releve)[1].lower()
-
-    if extension == ".csv":
-        df_releve = pd.read_csv(fichier_releve)
-        df_releve["Date"] = pd.to_datetime(df_releve["Date"], errors="coerce", dayfirst=True).dt.date
-        df_releve["Montant"] = pd.to_numeric(df_releve["Montant"], errors="coerce").fillna(0)
-    else:
-        df_releve = ocr_releve_bancaire(fichier_releve)
-
-    # Filtrer le compte banque dans le Grand Journal
-    df_banque = df_grand_journal[df_grand_journal["Numéro de compte"].astype(str).str.startswith("512")].copy()
-    df_banque["Montant"] = df_banque["Débit (Ar)"] - df_banque["Crédit (Ar)"]
-
-    resultats = []
-    for _, op in df_banque.iterrows():
-        match = df_releve[
-            (abs(pd.to_datetime(df_releve["Date"]) - pd.to_datetime(op["Date"])).dt.days <= seuil_jours) &
-            (df_releve["Montant"].round(0) == round(op["Montant"], 0))
-        ]
-        if not match.empty:
-            statut = "OK"
+    # Nettoyage colonnes numériques
+    for col in ["Débit (Ar)", "Crédit (Ar)"]:
+        if col in df.columns:
+            df[col] = (
+                df[col].astype(str)
+                .str.replace(r"[^\d\-,.]", "", regex=True)
+                .str.replace(",", ".", regex=False)
+            )
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         else:
-            statut = "Écart (non trouvé sur relevé)"
-        resultats.append(statut)
+            df[col] = 0
 
-    df_banque["Statut rapprochement"] = resultats
+    # Normaliser date pour le tri (si existante)
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    else:
+        df["Date"] = pd.NaT
 
-    # Vérifier aussi les opérations du relevé absentes en compta
-    ecarts_releve = []
-    for _, op in df_releve.iterrows():
-        match = df_banque[
-            (abs(pd.to_datetime(df_banque["Date"]) - pd.to_datetime(op["Date"])).dt.days <= seuil_jours) &
-            (df_banque["Montant"].round(0) == round(op["Montant"], 0))
-        ]
-        if match.empty:
-            ecarts_releve.append(op)
-    df_ecarts_releve = pd.DataFrame(ecarts_releve)
+    résultats = []
 
-    return df_banque, df_ecarts_releve
+    # Pour chaque compte, on tente de lettrer
+    for compte, grp in df.groupby("Numéro de compte", sort=False):
+        df_c = grp.sort_values(by=["Date", "Référence"]).reset_index(drop=True)
 
-def generer_balance(df_grand_journal):
+        # Montant signé et absolu
+        df_c["amount"] = df_c["Débit (Ar)"] - df_c["Crédit (Ar)"]
+        df_c["abs_amount"] = df_c["amount"].abs()
+        df_c["sign"] = df_c["amount"].apply(lambda x: "D" if x > 0 else ("C" if x < 0 else "0"))
+        df_c["remaining"] = df_c["abs_amount"].copy()
+        df_c["Lettrage"] = ""  # on stockera des id L1;L2...
+        
+        # files: debit queue (positive), credit queue (positive absolut)
+        deb_q = deque([(i, row["remaining"]) for i, row in df_c[df_c["sign"] == "D"].iterrows()])
+        cred_q = deque([(i, row["remaining"]) for i, row in df_c[df_c["sign"] == "C"].iterrows()])
+
+        let_idx = 1
+        # rapprochement (greedy) : on consomme les files
+        while deb_q and cred_q:
+            i_idx, i_amt = deb_q.popleft()
+            j_idx, j_amt = cred_q.popleft()
+
+            # tolérance (par sécurité float)
+            if abs(i_amt - j_amt) < 1e-6:
+                tag = f"L{let_idx}"
+                # append tag
+                df_c.at[i_idx, "Lettrage"] = (df_c.at[i_idx, "Lettrage"] + ";" + tag) if df_c.at[i_idx, "Lettrage"] else tag
+                df_c.at[j_idx, "Lettrage"] = (df_c.at[j_idx, "Lettrage"] + ";" + tag) if df_c.at[j_idx, "Lettrage"] else tag
+                df_c.at[i_idx, "remaining"] = 0
+                df_c.at[j_idx, "remaining"] = 0
+                let_idx += 1
+            elif i_amt > j_amt:
+                tag = f"L{let_idx}"
+                df_c.at[j_idx, "Lettrage"] = (df_c.at[j_idx, "Lettrage"] + ";" + tag) if df_c.at[j_idx, "Lettrage"] else tag
+                df_c.at[j_idx, "remaining"] = 0
+                new_i = i_amt - j_amt
+                df_c.at[i_idx, "remaining"] = new_i
+                # remettre le débit restant en tête (on continue à le rapprocher)
+                deb_q.appendleft((i_idx, new_i))
+                let_idx += 1
+            else:  # i_amt < j_amt
+                tag = f"L{let_idx}"
+                df_c.at[i_idx, "Lettrage"] = (df_c.at[i_idx, "Lettrage"] + ";" + tag) if df_c.at[i_idx, "Lettrage"] else tag
+                df_c.at[i_idx, "remaining"] = 0
+                new_j = j_amt - i_amt
+                df_c.at[j_idx, "remaining"] = new_j
+                cred_q.appendleft((j_idx, new_j))
+                let_idx += 1
+
+        # Statut final selon remaining
+        def statut_ligne(r):
+            if r["abs_amount"] == 0:
+                return "Zéro"
+            if r["remaining"] == 0:
+                return "Soldé"
+            if r["remaining"] < r["abs_amount"]:
+                return "Partiellement lettré"
+            return "Non soldé"
+
+        df_c["Statut"] = df_c.apply(statut_ligne, axis=1)
+
+        # Solde partiel signé : remaining avec signe
+        def solde_partiel_signed(r):
+            if r["sign"] == "D":
+                return r["remaining"]
+            if r["sign"] == "C":
+                return -r["remaining"]
+            return 0
+        df_c["Solde partiel"] = df_c.apply(solde_partiel_signed, axis=1)
+
+        résultats.append(df_c)
+
+    if len(résultats) == 0:
+        return pd.DataFrame()
+
+    df_out = pd.concat(résultats, ignore_index=True, sort=False)
+
+    # Colonnes de sortie dans l'ordre souhaité
+    colonnes = ["Numéro de compte", "Date", "Référence", "Libellé",
+                "Débit (Ar)", "Crédit (Ar)", "Solde partiel", "Statut", "Lettrage"]
+    for c in colonnes:
+        if c not in df_out.columns:
+            df_out[c] = ""
+
+    df_out = df_out[colonnes]
+    df_out.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+    return df_out
+
+
+# =====================
+# Rapprochement bancaire
+# =====================
+
+reader = easyocr.Reader(['fr'])
+
+def pdf_image_to_df(file):
+    pages = convert_from_path(file) if file.name.endswith(".pdf") else [file]
+    lignes = []
+    for page in pages:
+        img = np.array(page)
+        result = reader.readtext(img)
+        for (_, texte, _) in result:
+            lignes.append(texte)
+    data = []
+    for l in lignes:
+        date_match = re.search(r'\d{2}/\d{2}/\d{4}', l)
+        montant_match = re.search(r'[-]?\d+(?:[.,]\d{2})?', l)
+        if date_match and montant_match:
+            date = pd.to_datetime(date_match.group(), dayfirst=True).date()
+            montant = float(montant_match.group().replace(',', '.'))
+            libelle = l.replace(date_match.group(), '').replace(montant_match.group(), '').strip()
+            data.append([date, libelle, montant])
+    df = pd.DataFrame(data, columns=["Date", "Libellé", "Montant"])
+    return df
+
+
+def rapprochement_bancaire(df_journal, df_releve, seuil_jours=3, seuil_montant=100):
+    df_journal = df_journal.copy()
+    df_releve = df_releve.copy()
+    df_journal["Date"] = pd.to_datetime(df_journal["Date"], errors="coerce").dt.date
+    df_journal["Montant"] = df_journal.get("Débit (Ar)", 0) - df_journal.get("Crédit (Ar)", 0)
+    df_journal["Statut"] = "Non rapproché"
+    df_releve["Statut"] = "Non rapproché"
+
+    for i, row_j in df_journal.iterrows():
+        for j, row_r in df_releve.iterrows():
+            if row_r["Statut"] == "Rapproché":
+                continue
+            date_ok = abs((row_j["Date"] - row_r["Date"]).days) <= seuil_jours
+            montant_ok = abs(row_j["Montant"] - row_r["Montant"]) <= seuil_montant
+            if date_ok and montant_ok:
+                df_journal.at[i, "Statut"] = "Rapproché"
+                df_releve.at[j, "Statut"] = "Rapproché"
+                break
+
+    df_result = pd.concat([
+        df_journal[["Date", "Libellé", "Montant", "Statut"]],
+        df_releve.rename(columns={"Libellé":"Libellé_releve"})[["Date","Libellé_releve","Montant","Statut"]]
+    ], axis=1)
+    return df_result
+
+
+import pandas as pd
+
+def generer_balance(df_grand_journal, fichier_sortie="balance.csv"):
     """
     Génère la balance comptable à partir du Grand Journal.
-    
-    df_grand_journal : DataFrame issu de aggreger_en_grand_journal()
-    
-    Retourne : DataFrame balance
+    Retourne un DataFrame avec :
+    - Numéro de compte
+    - Débit total
+    - Crédit total
+    - Solde Débiteur
+    - Solde Créditeur
     """
-    # Nettoyer colonnes montants
-    df_grand_journal["Débit (Ar)"] = pd.to_numeric(df_grand_journal["Débit (Ar)"], errors="coerce").fillna(0)
-    df_grand_journal["Crédit (Ar)"] = pd.to_numeric(df_grand_journal["Crédit (Ar)"], errors="coerce").fillna(0)
 
-    # Regrouper par compte
-    balance = df_grand_journal.groupby("Numéro de compte").agg({
+    if df_grand_journal.empty:
+        return pd.DataFrame()
+
+    df = df_grand_journal.copy()
+
+    # Vérifier colonnes obligatoires
+    colonnes_attendues = ["Numéro de compte", "Débit (Ar)", "Crédit (Ar)"]
+    for col in colonnes_attendues:
+        if col not in df.columns:
+            raise ValueError(f"Colonne manquante dans le fichier : {col}")
+
+    # Nettoyage colonnes numériques
+    for col in ["Débit (Ar)", "Crédit (Ar)"]:
+        df[col] = (
+            df[col].astype(str)
+            .str.replace(r"[^\d\-,.]", "", regex=True)   # garder seulement chiffres, signe, point, virgule
+            .str.replace(",", ".", regex=False)         # uniformiser les décimales
+        )
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    # Grouper par compte
+    df_balance = df.groupby("Numéro de compte", as_index=False).agg({
         "Débit (Ar)": "sum",
         "Crédit (Ar)": "sum"
-    }).reset_index()
-
-    # Calcul des soldes
-    balance["Solde Débiteur"] = balance["Débit (Ar)"] - balance["Crédit (Ar)"]
-    balance["Solde Créditeur"] = balance["Crédit (Ar)"] - balance["Débit (Ar)"]
-
-    # Si le solde est négatif, on remet à 0 dans la mauvaise colonne
-    balance["Solde Débiteur"] = balance["Solde Débiteur"].apply(lambda x: x if x > 0 else 0)
-    balance["Solde Créditeur"] = balance["Solde Créditeur"].apply(lambda x: x if x > 0 else 0)
-
-    # Vérification équilibre
-    total_debit = balance["Débit (Ar)"].sum()
-    total_credit = balance["Crédit (Ar)"].sum()
-
-    return balance, total_debit, total_credit
-
-def travaux_inventaire(df_grand_journal, amortissements=[], provisions=[], charges_avance=[], produits_attendus=[]):
-    """
-    df_grand_journal : Grand Journal
-    Les autres listes contiennent des dictionnaires de type :
-    {"compte": "218", "libelle": "Amortissement ordinateur", "montant": 1000000, "date": "2025-12-31"}
-    """
-    df_modif = df_grand_journal.copy()
-    
-    for ecriture in amortissements + provisions + charges_avance + produits_attendus:
-        df_modif = pd.concat([df_modif, pd.DataFrame([{
-            "Date": ecriture["date"],
-            "Numéro de compte": ecriture["compte"],
-            "Libellé": ecriture["libelle"],
-            "Débit (Ar)": ecriture.get("debit",0),
-            "Crédit (Ar)": ecriture.get("credit",0),
-            "Type journal": "OD",
-            "Référence": ""
-        }])], ignore_index=True)
-    
-    # Convertir les colonnes Débit/Crédit en numérique
-    df_modif["Débit (Ar)"] = pd.to_numeric(df_modif["Débit (Ar)"], errors="coerce").fillna(0)
-    df_modif["Crédit (Ar)"] = pd.to_numeric(df_modif["Crédit (Ar)"], errors="coerce").fillna(0)
-    
-    return df_modif
-
-def generer_bilan(df_grand_journal):
-    """
-    Génère un Bilan simplifié à partir du Grand Journal.
-    """
-    df = df_grand_journal.copy()
-    df["Débit (Ar)"] = pd.to_numeric(df["Débit (Ar)"], errors="coerce").fillna(0)
-    df["Crédit (Ar)"] = pd.to_numeric(df["Crédit (Ar)"], errors="coerce").fillna(0)
-
-    # Actif : comptes commençant par 1 à 5
-    actif = df[df["Numéro de compte"].astype(str).str.match(r"^[1-5]")]
-    actif_total = (actif["Débit (Ar)"] - actif["Crédit (Ar)"]).sum()
-
-    # Passif : comptes commençant par 2 à 5
-    passif = df[df["Numéro de compte"].astype(str).str.match(r"^[2-5]")]
-    passif_total = (passif["Crédit (Ar)"] - passif["Débit (Ar)"]).sum()
-
-    bilan = pd.DataFrame({
-        "Catégorie": ["Actif", "Passif"],
-        "Montant (Ar)": [actif_total, passif_total]
     })
 
-    return bilan, actif_total, passif_total
-def generer_compte_resultat(df_grand_journal):
-    """
-    Génère un Compte de Résultat simplifié à partir du Grand Journal.
-    """
-    df = df_grand_journal.copy()
-    df["Débit (Ar)"] = pd.to_numeric(df["Débit (Ar)"], errors="coerce").fillna(0)
-    df["Crédit (Ar)"] = pd.to_numeric(df["Crédit (Ar)"], errors="coerce").fillna(0)
+    # Calcul solde et séparation Débiteur/Créditeur
+    df_balance["Solde"] = df_balance["Débit (Ar)"] - df_balance["Crédit (Ar)"]
+    df_balance["Solde Débiteur"] = df_balance["Solde"].apply(lambda x: x if x > 0 else 0)
+    df_balance["Solde Créditeur"] = df_balance["Solde"].apply(lambda x: -x if x < 0 else 0)
+    df_balance.drop(columns=["Solde"], inplace=True)
 
-    # Charges : comptes 6
-    charges = df[df["Numéro de compte"].astype(str).str.startswith("6")]
-    total_charges = charges["Débit (Ar)"].sum()
+    # Formatage en Ar
+    for col in ["Débit (Ar)", "Crédit (Ar)", "Solde Débiteur", "Solde Créditeur"]:
+        df_balance[col] = df_balance[col].apply(lambda x: f"{int(x):,} Ar".replace(",", " "))
 
-    # Produits : comptes 7
-    produits = df[df["Numéro de compte"].astype(str).str.startswith("7")]
-    total_produits = produits["Crédit (Ar)"].sum()
+    # Export CSV
+    df_balance.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
 
-    resultat_net = total_produits - total_charges
-
-    compte_resultat = pd.DataFrame({
-        "Catégorie": ["Produits", "Charges", "Résultat Net"],
-        "Montant (Ar)": [total_produits, total_charges, resultat_net]
-    })
-
-    return compte_resultat, total_produits, total_charges, resultat_net
+    return df_balance
 
 
 # ==========================
 # INTERFACE STREAMLIT
 # ==========================
 st.markdown('<h2 style="color: green; text-align:center;">Automatisation des Processus Comptables</h2>', unsafe_allow_html=True)
+
+# Section 1: Upload et traitement des fichiers
+st.markdown("<h5>Upload et Traitement des Documents</h5>", unsafe_allow_html=True)
 fichiers = st.file_uploader("Upload fichiers (images, PDF, CSV, Excel)", type=["png","jpg","jpeg","pdf","csv","xlsx"], accept_multiple_files=True)
 
 if st.button("Traiter") and fichiers:
@@ -551,27 +660,27 @@ if st.button("Traiter") and fichiers:
     if donnees:
         df = pd.DataFrame(donnees)
         df = detecter_doublons(df)
-        df_final = aggreger_en_grand_journal(donnees, CSV_OUTPUT)
+        st.session_state.df_final = aggreger_en_grand_journal(donnees, CSV_OUTPUT)
         st.success(f"✅ Extraction terminée, exporté dans {CSV_OUTPUT}")
 
-        types_dispo = df_final["Type journal"].unique().tolist()
+        types_dispo = st.session_state.df_final["Type journal"].unique().tolist()
         for tj in types_dispo:
             st.markdown(f"Type Journal : {tj.capitalize()}")
-            df_tj = df_final[df_final["Type journal"]==tj].copy()
+            df_tj = st.session_state.df_final[st.session_state.df_final["Type journal"]==tj].copy()
             df_tj = df_tj.sort_values(by="Date").reset_index(drop=True)
             st.dataframe(df_tj)
 
-        st.markdown("# Grand Journal complet")
-        st.dataframe(df_final)
+        st.markdown("<h4> Grand Journal complet </h4>", unsafe_allow_html=True)
+        st.dataframe(st.session_state.df_final)
         st.download_button(
             "⬇️ Télécharger le Grand Journal",
-            data=df_final.to_csv(index=False, encoding="utf-8-sig"),
+            data=st.session_state.df_final.to_csv(index=False, encoding="utf-8-sig"),
             file_name=CSV_OUTPUT,
             mime="text/csv"
         )
 
-        st.markdown("# Grand Livre")
-        df_grand_livre = generer_grand_livre(df_final, "grand_livre.csv")
+        st.markdown("<h4> Grand Livre </h4>", unsafe_allow_html=True)
+        df_grand_livre = generer_grand_livre(st.session_state.df_final, "grand_livre.csv")
         st.dataframe(df_grand_livre)
         st.download_button(
             "⬇️ Télécharger le Grand Livre",
@@ -580,98 +689,80 @@ if st.button("Traiter") and fichiers:
             mime="text/csv"
         )
 
+        # Titre
+        st.markdown("<h4>Lettrage des comptes</h4>", unsafe_allow_html=True)
 
-st.markdown("Rapprochement Bancaire")
-fichier_releve = st.file_uploader("Uploader le relevé bancaire (CSV, PDF ou image)", type=["csv","pdf","png","jpg","jpeg"])
+        # Génération du lettrage à partir du grand journal final
+        df_lettrage = generer_lettrage(st.session_state.df_final, "lettrage.csv")
 
-if fichier_releve:
-    temp_releve = "temp_releve" + os.path.splitext(fichier_releve.name)[1]
-    with open(temp_releve,"wb") as f:
-        f.write(fichier_releve.read())
+        # Affichage dans Streamlit
+        st.dataframe(
+            df_lettrage.style.format({
+                "Débit (Ar)": "{:,.0f}".format,
+                "Crédit (Ar)": "{:,.0f}".format,
+                "Solde partiel": "{:,.0f}".format
+            })
+        )
 
-    df_banque, df_ecarts_releve = rapprochement_bancaire(df_final, temp_releve)
+        # Bouton de téléchargement
+        st.download_button(
+            "⬇️ Télécharger le Lettrage",
+            data=df_lettrage.to_csv(index=False, encoding="utf-8-sig"),
+            file_name="lettrage.csv",
+            mime="text/csv"
+        )
 
-    st.markdown("Écritures du compte 512 avec statut de rapprochement")
-    st.dataframe(df_banque)
+st.markdown("<h4>Rapprochement bancaire</h4>", unsafe_allow_html=True)
 
-    st.markdown("Opérations du relevé absentes en compta")
-    st.dataframe(df_ecarts_releve)
+    # Upload Grand Livre
+uploaded_journal = st.file_uploader("Importer Grand Livre (CSV ou Excel)", type=["csv","xlsx"])
+# Upload Relevé bancaire
+uploaded_releve = st.file_uploader("Importer Relevé bancaire (CSV, Excel ou PDF/image)", type=["csv","xlsx","pdf","png","jpg","jpeg"])
 
-    st.download_button(
-        "⬇️ Exporter Résultat Rapprochement",
-        data=df_banque.to_csv(index=False, encoding="utf-8-sig"),
-        file_name="rapprochement_bancaire.csv",
-        mime="text/csv"
-    )
+df_journal, df_releve = None, None
 
-    os.remove(temp_releve)
-
-st.markdown("Balance Comptable")
-
-if st.button("Générer la Balance"):
-    balance, total_debit, total_credit = generer_balance(df_final)
-
-    st.dataframe(balance)
-
-    st.write(f"✅ Total Débit : {total_debit:,.0f} Ar")
-    st.write(f"✅ Total Crédit : {total_credit:,.0f} Ar")
-
-    if total_debit == total_credit:
-        st.success("La balance est équilibrée ✅")
+if uploaded_journal:
+    if uploaded_journal.name.endswith(".csv"):
+        df_journal = pd.read_csv(uploaded_journal)
     else:
-        st.error("⚠️ La balance n'est pas équilibrée !")
+        df_journal = pd.read_excel(uploaded_journal)
 
+if uploaded_releve:
+    if uploaded_releve.name.endswith((".csv", ".xlsx")):
+        df_releve = pd.read_csv(uploaded_releve) if uploaded_releve.name.endswith(".csv") else pd.read_excel(uploaded_releve)
+        df_releve.rename(columns={"Débit (Ar)":"Montant","Crédit (Ar)":"Montant"}, inplace=True)
+    else:
+        df_releve = pdf_image_to_df(uploaded_releve)
+
+
+# Lancer rapprochement
+if df_journal is not None and df_releve is not None:
+    df_result = rapprochement_bancaire(df_journal, df_releve)
+    st.dataframe(df_result)
+    st.download_button("⬇️ Télécharger le rapprochement", df_result.to_csv(index=False, encoding="utf-8-sig"), "rapprochement.csv", "text/csv")
+
+
+
+    st.markdown("<h4>Balance comptable</h4>", unsafe_allow_html=True)
+
+    # Balance brute (avec nombres pour export CSV)
+    df_balance_brut = generer_balance(st.session_state.df_final, "balance.csv")
+
+    # Créer une copie formatée pour affichage
+    df_balance_affichage = df_balance_brut.copy()
+    for col in ["Débit (Ar)", "Crédit (Ar)", "Solde Débiteur", "Solde Créditeur"]:
+        df_balance_affichage[col] = df_balance_affichage[col].apply(
+            lambda x: f"{int(str(x).replace(' Ar','').replace(' ','') or 0):,} Ar"
+        )
+
+    # Afficher dans Streamlit
+    st.dataframe(df_balance_affichage)
+
+    # Bouton téléchargement CSV (avec les valeurs numériques brutes)
     st.download_button(
-        "⬇️ Exporter la Balance en CSV",
-        data=balance.to_csv(index=False, encoding="utf-8-sig"),
-        file_name="balance_comptable.csv",
-        mime="text/csv"
-    )
-
-st.markdown(" Travaux d'inventaire")
-
-if st.button("Appliquer Travaux d'Inventaire"):
-    # Exemple simple : 1 amortissement et 1 provision
-    amortissements = [{"compte":"218", "libelle":"Amortissement ordinateur", "credit":1000000, "date":"2025-12-31"}]
-    provisions = [{"compte":"681", "libelle":"Provision clients douteux", "debit":200000, "date":"2025-12-31"}]
-
-    df_modifie = travaux_inventaire(df_final, amortissements=amortissements, provisions=provisions)
-    st.dataframe(df_modifie)
-
-    st.download_button(
-        "⬇️ Exporter Grand Journal après inventaire",
-        data=df_modifie.to_csv(index=False, encoding="utf-8-sig"),
-        file_name="grand_journal_inventaire.csv",
-        mime="text/csv"
-    )
-
-st.markdown("États Financiers")
-
-if st.button("Générer Bilan et Compte de Résultat"):
-    bilan, actif_total, passif_total = generer_bilan(df_modifie)
-    compte_resultat, total_produits, total_charges, resultat_net = generer_compte_resultat(df_modifie)
-
-    st.markdown("### Bilan")
-    st.dataframe(bilan)
-    st.write(f"Total Actif : {actif_total:,.0f} Ar")
-    st.write(f"Total Passif : {passif_total:,.0f} Ar")
-
-    st.markdown("### Compte de Résultat")
-    st.dataframe(compte_resultat)
-    st.write(f"Total Produits : {total_produits:,.0f} Ar")
-    st.write(f"Total Charges : {total_charges:,.0f} Ar")
-    st.write(f"Résultat Net : {resultat_net:,.0f} Ar")
-
-    st.download_button(
-        "⬇️ Exporter Bilan",
-        data=bilan.to_csv(index=False, encoding="utf-8-sig"),
-        file_name="bilan.csv",
-        mime="text/csv"
-    )
-    st.download_button(
-        "⬇️ Exporter Compte de Résultat",
-        data=compte_resultat.to_csv(index=False, encoding="utf-8-sig"),
-        file_name="compte_resultat.csv",
+        "⬇️ Télécharger la Balance",
+        data=df_balance_brut.to_csv(index=False, encoding="utf-8-sig"),
+        file_name="balance.csv",
         mime="text/csv"
     )
 
