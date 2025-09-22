@@ -711,34 +711,34 @@ if st.button("Traiter") and fichiers:
             mime="text/csv"
         )
 
-st.markdown("<h4>Rapprochement bancaire</h4>", unsafe_allow_html=True)
+    st.markdown("<h4>Rapprochement bancaire</h4>", unsafe_allow_html=True)
 
-    # Upload Grand Livre
-uploaded_journal = st.file_uploader("Importer Grand Livre (CSV ou Excel)", type=["csv","xlsx"])
-# Upload Relevé bancaire
-uploaded_releve = st.file_uploader("Importer Relevé bancaire (CSV, Excel ou PDF/image)", type=["csv","xlsx","pdf","png","jpg","jpeg"])
+        # Upload Grand Livre
+    uploaded_journal = st.file_uploader("Importer Grand Livre (CSV ou Excel)", type=["csv","xlsx"])
+    # Upload Relevé bancaire
+    uploaded_releve = st.file_uploader("Importer Relevé bancaire (CSV, Excel ou PDF/image)", type=["csv","xlsx","pdf","png","jpg","jpeg"])
 
-df_journal, df_releve = None, None
+    df_journal, df_releve = None, None
 
-if uploaded_journal:
-    if uploaded_journal.name.endswith(".csv"):
-        df_journal = pd.read_csv(uploaded_journal)
-    else:
-        df_journal = pd.read_excel(uploaded_journal)
+    if uploaded_journal:
+        if uploaded_journal.name.endswith(".csv"):
+            df_journal = pd.read_csv(uploaded_journal)
+        else:
+            df_journal = pd.read_excel(uploaded_journal)
 
-if uploaded_releve:
-    if uploaded_releve.name.endswith((".csv", ".xlsx")):
-        df_releve = pd.read_csv(uploaded_releve) if uploaded_releve.name.endswith(".csv") else pd.read_excel(uploaded_releve)
-        df_releve.rename(columns={"Débit (Ar)":"Montant","Crédit (Ar)":"Montant"}, inplace=True)
-    else:
-        df_releve = pdf_image_to_df(uploaded_releve)
+    if uploaded_releve:
+        if uploaded_releve.name.endswith((".csv", ".xlsx")):
+            df_releve = pd.read_csv(uploaded_releve) if uploaded_releve.name.endswith(".csv") else pd.read_excel(uploaded_releve)
+            df_releve.rename(columns={"Débit (Ar)":"Montant","Crédit (Ar)":"Montant"}, inplace=True)
+        else:
+            df_releve = pdf_image_to_df(uploaded_releve)
 
 
-# Lancer rapprochement
-if df_journal is not None and df_releve is not None:
-    df_result = rapprochement_bancaire(df_journal, df_releve)
-    st.dataframe(df_result)
-    st.download_button("⬇️ Télécharger le rapprochement", df_result.to_csv(index=False, encoding="utf-8-sig"), "rapprochement.csv", "text/csv")
+    # Lancer rapprochement
+    if df_journal is not None and df_releve is not None:
+        df_result = rapprochement_bancaire(df_journal, df_releve)
+        st.dataframe(df_result)
+        st.download_button("⬇️ Télécharger le rapprochement", df_result.to_csv(index=False, encoding="utf-8-sig"), "rapprochement.csv", "text/csv")
 
 
 
