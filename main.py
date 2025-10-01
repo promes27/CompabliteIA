@@ -612,6 +612,167 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv"):
     return df_balance
 
 
+def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv"):
+    """
+    Génère un bilan simplifié (Actif / Passif) à partir de la balance fournie.
+    df_balance_brut : DataFrame retourné par generer_balance (colonnes Débit (Ar), Crédit (Ar))
+    Retour : DataFrame du bilan (Actif / Passif) et sauvegarde CSV.
+    """
+    if df_balance_brut is None or df_balance_brut.empty:
+        return pd.DataFrame()
+
+    df = df_balance_brut.copy()
+
+    # Vérifier colonnes
+    for col in ["Débit (Ar)", "Crédit (Ar)"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Convertir en numérique
+    df["_debit_num"] = df["Débit (Ar)"].apply(parse_montant)
+    df["_credit_num"] = df["Crédit (Ar)"].apply(parse_montant)
+    df["_net"] = df["_debit_num"] - df["_credit_num"]  # positif = Actif, négatif = Passif
+
+    # Classification simple par préfixe
+    def classifier_compte(numero):
+        n = str(numero).strip()
+        if not n:
+            return "Non classé"
+        if n.startswith("2"):
+            return "Actif immobilisé"
+        if n.startswith("3"):
+            return "Stocks"
+        if n.startswith("41") or n.startswith("46"):
+            return "Créances clients et divers"
+        if n.startswith("40") or n.startswith("42") or n.startswith("44"):
+            return "Dettes fournisseurs / Tiers"
+        if n.startswith("5") or n.startswith("53") or n.startswith("512"):
+            return "Disponibilités (Banque / Caisse)"
+        if n.startswith("1"):
+            return "Capitaux propres et assimilés"
+        if n.startswith("16") or n.startswith("17") or n.startswith("19"):
+            return "Emprunts et dettes financières"
+        return "Autres"
+
+    df["Poste"] = df["Numéro de compte"].apply(classifier_compte)
+
+    # Construire total par poste
+    postes = {}
+    for _, row in df.iterrows():
+        poste = row["Poste"]
+        net = row["_net"]
+        if poste not in postes:
+            postes[poste] = {"actif": 0.0, "passif": 0.0}
+        if net > 0:
+            postes[poste]["actif"] += net
+        elif net < 0:
+            postes[poste]["passif"] += -net
+
+    # Construire DataFrame bilan
+    lignes = []
+    for poste, vals in postes.items():
+        lignes.append({
+            "Poste": poste,
+            "Actif (Ar)": vals["actif"],
+            "Passif (Ar)": vals["passif"]
+        })
+    df_bilan = pd.DataFrame(lignes).sort_values(by="Poste").reset_index(drop=True)
+
+    # Totaux
+    total_actif = df_bilan["Actif (Ar)"].sum()
+    total_passif = df_bilan["Passif (Ar)"].sum()
+
+    totals_row = pd.DataFrame([{
+        "Poste": "TOTAL",
+        "Actif (Ar)": total_actif,
+        "Passif (Ar)": total_passif
+    }])
+    df_bilan_aff = pd.concat([df_bilan, totals_row], ignore_index=True)
+
+    # Mise en forme
+    df_bilan_aff["Actif (Ar)"] = df_bilan_aff["Actif (Ar)"].apply(lambda x: f"{int(round(x)):,}".replace(",", " ") + " Ar" if x != 0 else "")
+    df_bilan_aff["Passif (Ar)"] = df_bilan_aff["Passif (Ar)"].apply(lambda x: f"{int(round(x)):,}".replace(",", " ") + " Ar" if x != 0 else "")
+
+    # Sauvegarde CSV
+    df_bilan_aff.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+
+    return df_bilan_aff, total_actif, total_passif
+
+
+def generer_compte_resultat(df_balance, fichier_sortie="compte_resultat.csv"):
+    """
+    Génère un compte de résultat simplifié (Charges / Produits).
+    """
+    if df_balance is None or df_balance.empty:
+        return pd.DataFrame()
+
+    df = df_balance.copy()
+
+    # Nettoyer montants
+    df["_debit_num"] = df["Débit (Ar)"].apply(parse_montant)
+    df["_credit_num"] = df["Crédit (Ar)"].apply(parse_montant)
+    df["_net"] = df["_debit_num"] - df["_credit_num"]
+
+    charges = df[df["Numéro de compte"].astype(str).str.startswith("6")]
+    produits = df[df["Numéro de compte"].astype(str).str.startswith("7")]
+
+    total_charges = charges["_debit_num"].sum()
+    total_produits = produits["_credit_num"].sum()
+    resultat_net = total_produits - total_charges
+
+    # Préparer tableau résultat
+    data = {
+        "Charges (classe 6)": [f"{int(round(total_charges)):,}".replace(",", " ") + " Ar"],
+        "Produits (classe 7)": [f"{int(round(total_produits)):,}".replace(",", " ") + " Ar"],
+        "Résultat Net": [f"{int(round(resultat_net)):,}".replace(",", " ") + " Ar"]
+    }
+
+    df_cr = pd.DataFrame(data)
+
+    # Export CSV
+    df_cr.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+
+    return df_cr, total_charges, total_produits, resultat_net
+
+
+def generer_annexe(df_grand_livre, fichier_sortie="annexe.csv"):
+    """
+    Génère une annexe simplifiée à partir du grand livre.
+    """
+    if df_grand_livre.empty:
+        return pd.DataFrame()
+    
+    # Immobilisations (comptes 2xx)
+    immobilisations = df_grand_livre[df_grand_livre["Numéro de compte"].str.startswith("2")]
+    immobilisations_detail = immobilisations.groupby("Numéro de compte").agg({
+        "Débit (Ar)": "sum",
+        "Crédit (Ar)": "sum"
+    }).reset_index()
+    immobilisations_detail["Valeur nette"] = immobilisations_detail["Débit (Ar)"] - immobilisations_detail["Crédit (Ar)"]
+
+    # Clients (411) et Fournisseurs (401)
+    clients = df_grand_livre[df_grand_livre["Numéro de compte"].str.startswith("411")].groupby("Numéro de compte").agg({"Solde": "sum"}).reset_index()
+    fournisseurs = df_grand_livre[df_grand_livre["Numéro de compte"].str.startswith("401")].groupby("Numéro de compte").agg({"Solde": "sum"}).reset_index()
+
+    # Provisions (compte 15xx)
+    provisions = df_grand_livre[df_grand_livre["Numéro de compte"].str.startswith("15")].groupby("Numéro de compte").agg({"Solde": "sum"}).reset_index()
+
+    # Export CSV
+    with pd.ExcelWriter(fichier_sortie) as writer:
+        immobilisations_detail.to_excel(writer, sheet_name="Immobilisations", index=False)
+        clients.to_excel(writer, sheet_name="Clients", index=False)
+        fournisseurs.to_excel(writer, sheet_name="Fournisseurs", index=False)
+        provisions.to_excel(writer, sheet_name="Provisions", index=False)
+    
+    return {
+        "Immobilisations": immobilisations_detail,
+        "Clients": clients,
+        "Fournisseurs": fournisseurs,
+        "Provisions": provisions
+    }
+
+
+
 # ==========================
 # INTERFACE STREAMLIT
 # ==========================
@@ -765,3 +926,76 @@ if st.button("Traiter") and fichiers:
         mime="text/csv"
     )
 
+
+    # Générer le bilan
+    df_bilan, tot_actif, tot_passif = generer_bilan(df_balance_brut, "bilan.csv")
+
+    st.markdown("<h4 style='margin-top:20px;'>📊 Bilan simplifié</h4>", unsafe_allow_html=True)
+
+    # Affichage du tableau
+    st.dataframe(df_bilan, use_container_width=True)
+
+    # Vérification équilibre
+    if int(round(tot_actif)) == int(round(tot_passif)):
+        st.success(f"✅ Bilan équilibré : Actif = Passif = {int(round(tot_actif)):,} Ar".replace(",", " "))
+    else:
+        st.warning(f"⚠️ Bilan déséquilibré : Actif = {int(round(tot_actif)):,} Ar, "
+                f"Passif = {int(round(tot_passif)):,} Ar".replace(",", " "))
+
+    # Bouton de téléchargement
+    st.download_button(
+        "⬇️ Télécharger le Bilan",
+        data=df_bilan.to_csv(index=False, encoding="utf-8-sig"),
+        file_name="bilan.csv",
+        mime="text/csv"
+    )
+
+    # ============================
+    # 2. Compte de Résultat
+    # ============================
+
+    st.markdown("<h3 style='margin-top:30px;'>📗 Compte de Résultat</h3>", unsafe_allow_html=True)
+
+    df_cr, total_charges, total_produits, resultat_net = generer_compte_resultat(df_balance_brut, "compte_resultat.csv")
+
+    if df_cr is not None and not df_cr.empty:
+        st.dataframe(df_cr, use_container_width=True)
+
+        if resultat_net > 0:
+            st.success(f"✅ Résultat Net : Bénéfice de {int(round(resultat_net)):,} Ar".replace(",", " "))
+        elif resultat_net < 0:
+            st.error(f"❌ Résultat Net : Perte de {int(round(abs(resultat_net))):,} Ar".replace(",", " "))
+        else:
+            st.info(" Résultat Net = 0 (ni bénéfice ni perte)")
+
+        st.download_button(
+            "⬇️ Télécharger le Compte de Résultat",
+            data=df_cr.to_csv(index=False, encoding="utf-8-sig"),
+            file_name="compte_resultat.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info(" Aucun compte de résultat généré. Vérifiez vos données.")
+
+
+    # Supposons que tu as déjà généré ton annexe
+    annexe = generer_annexe(df_grand_livre)
+
+    # Affichage par onglet pour chaque section
+    tabs = st.tabs(["Immobilisations", "Clients", "Fournisseurs", "Provisions"])
+
+    with tabs[0]:
+        st.markdown("<h4>Immobilisations</h4>", unsafe_allow_html=True)
+        st.dataframe(annexe["Immobilisations"])
+
+    with tabs[1]:
+        st.markdown("<h4>Clients</h4>", unsafe_allow_html=True)
+        st.dataframe(annexe["Clients"])
+
+    with tabs[2]:
+        st.markdown("<h4>Fournisseurs</h4>", unsafe_allow_html=True)
+        st.dataframe(annexe["Fournisseurs"])
+
+    with tabs[3]:
+        st.markdown("<h4>Provisions</h4>", unsafe_allow_html=True)
+        st.dataframe(annexe["Provisions"])
