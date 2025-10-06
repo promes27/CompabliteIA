@@ -771,7 +771,63 @@ def generer_annexe(df_grand_livre, fichier_sortie="annexe.csv"):
         "Provisions": provisions
     }
 
+def generer_amortissement(df_grand_journal, fichier_sortie="amortissement.csv", duree_defaut=5):
+    """
+    Génère automatiquement un plan d’amortissement linéaire
+    pour toutes les factures d’immobilisations (classe 2).
+    - duree_defaut = 5 ans si la durée n’est pas précisée
+    """
+    if df_grand_journal.empty:
+        return pd.DataFrame()
 
+    # Nettoyer colonnes numériques
+    for col in ["Débit (Ar)", "Crédit (Ar)"]:
+        df_grand_journal[col] = (
+            df_grand_journal[col].astype(str)
+            .str.replace(r"[^\d\-,.]", "", regex=True)
+            .str.replace(",", ".", regex=False)
+        )
+        df_grand_journal[col] = pd.to_numeric(df_grand_journal[col], errors="coerce").fillna(0)
+
+    # Filtrer immobilisations (comptes 2xxx en Débit)
+    # df_immo = df_grand_journal[df_grand_journal["Compte"].astype(str).str.startswith("2")].copy()
+    df_immo = df_grand_journal[df_grand_journal['Compte'].str.match(r'^\d+$')].copy()
+    # Vérification debug
+    st.write("Nombre de lignes immobilisations :", df_immo.shape[0])
+    
+    plans = []
+    for _, row in df_immo.iterrows():
+        date_acq = pd.to_datetime(row["Date"], errors="coerce")
+        montant = row["Débit (Ar)"] if row["Débit (Ar)"] > 0 else row["Crédit (Ar)"]
+
+        if pd.isna(date_acq) or montant <= 0:
+            continue
+
+        duree = duree_defaut
+        annuite = montant / duree
+
+        for i in range(1, duree + 1):
+            annee = date_acq.year + i - 1
+            plans.append({
+                "Référence": row.get("Référence", ""),
+                "Date acquisition": date_acq.date(),
+                "Compte immobilisation": row["Compte"], 
+                "Montant acquisition": montant,
+                "Année": annee,
+                "Durée (ans)": duree,
+                "Annuité": round(annuite, 2),
+                "Cumul amortissement": round(annuite * i, 2),
+                "Valeur nette comptable": round(montant - annuite * i, 2)
+            })
+
+    # Créer le DataFrame final
+    df_amort = pd.DataFrame(plans)
+
+    # Sauvegarde si non vide
+    if not df_amort.empty:
+        df_amort.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+
+    return df_amort 
 
 # ==========================
 # INTERFACE STREAMLIT
@@ -999,3 +1055,18 @@ if st.button("Traiter") and fichiers:
     with tabs[3]:
         st.markdown("<h4>Provisions</h4>", unsafe_allow_html=True)
         st.dataframe(annexe["Provisions"])
+        
+            # Génération du plan d'amortissement
+        df_amortissement = generer_amortissement(df_grand_livre)
+        st.markdown("<h4>📊 Plan d'Amortissement des Immobilisations</h4>", unsafe_allow_html=True)
+        if df_amortissement is not None and not df_amortissement.empty:
+        # Affichage complet dans un seul tableau
+            st.dataframe(df_amortissement)
+            st.download_button(
+                "⬇️ Télécharger le Plan d'Amortissement",
+                data=df_amortissement.to_csv(index=False, encoding="utf-8-sig"),
+                file_name="amortissement.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("Aucun amortissement généré (vérifiez vos données).")
