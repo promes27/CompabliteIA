@@ -611,7 +611,22 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv"):
 
     return df_balance
 
-
+def parse_montant(val):
+    """
+    Convertit un montant (ex: '1 200,50 Ar') en float.
+    Retourne 0.0 si la valeur n'est pas convertible.
+    """
+    if pd.isna(val):  # si valeur NaN
+        return 0.0
+    if isinstance(val, str):
+        # Nettoyage du texte
+        val = val.replace("Ar", "").replace(" ", "").replace("\u202f", "")
+        val = val.replace(",", ".")
+    try:
+        return float(val)
+    except ValueError:
+        return 0.0
+    
 def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv"):
     """
     Génère un bilan simplifié (Actif / Passif) à partir de la balance fournie.
@@ -743,19 +758,19 @@ def generer_annexe(df_grand_livre, fichier_sortie="annexe.csv"):
         return pd.DataFrame()
     
     # Immobilisations (comptes 2xx)
-    immobilisations = df_grand_livre[df_grand_livre["Numéro de compte"].str.startswith("2")]
-    immobilisations_detail = immobilisations.groupby("Numéro de compte").agg({
+    immobilisations = df_grand_livre[df_grand_livre["Compte"].str.startswith("2")]
+    immobilisations_detail = immobilisations.groupby("Compte").agg({
         "Débit (Ar)": "sum",
         "Crédit (Ar)": "sum"
     }).reset_index()
     immobilisations_detail["Valeur nette"] = immobilisations_detail["Débit (Ar)"] - immobilisations_detail["Crédit (Ar)"]
 
     # Clients (411) et Fournisseurs (401)
-    clients = df_grand_livre[df_grand_livre["Numéro de compte"].str.startswith("411")].groupby("Numéro de compte").agg({"Solde": "sum"}).reset_index()
-    fournisseurs = df_grand_livre[df_grand_livre["Numéro de compte"].str.startswith("401")].groupby("Numéro de compte").agg({"Solde": "sum"}).reset_index()
+    clients = df_grand_livre[df_grand_livre["Compte"].str.startswith("411")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
+    fournisseurs = df_grand_livre[df_grand_livre["Compte"].str.startswith("401")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
 
     # Provisions (compte 15xx)
-    provisions = df_grand_livre[df_grand_livre["Numéro de compte"].str.startswith("15")].groupby("Numéro de compte").agg({"Solde": "sum"}).reset_index()
+    provisions = df_grand_livre[df_grand_livre["Compte"].str.startswith("15")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
 
     # Export CSV
     with pd.ExcelWriter(fichier_sortie) as writer:
@@ -790,7 +805,11 @@ def generer_amortissement(df_grand_journal, fichier_sortie="amortissement.csv", 
         df_grand_journal[col] = pd.to_numeric(df_grand_journal[col], errors="coerce").fillna(0)
 
     # Filtrer immobilisations (comptes 2xxx en Débit)
+    
+            # Si compte 2xxx
     # df_immo = df_grand_journal[df_grand_journal["Compte"].astype(str).str.startswith("2")].copy()
+    
+            # Si n'importe quel compte
     df_immo = df_grand_journal[df_grand_journal['Compte'].str.match(r'^\d+$')].copy()
     # Vérification debug
     st.write("Nombre de lignes immobilisations :", df_immo.shape[0])
