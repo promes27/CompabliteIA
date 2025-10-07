@@ -807,10 +807,10 @@ def generer_amortissement(df_grand_journal, fichier_sortie="amortissement.csv", 
     # Filtrer immobilisations (comptes 2xxx en Débit)
     
             # Si compte 2xxx
-    # df_immo = df_grand_journal[df_grand_journal["Compte"].astype(str).str.startswith("2")].copy()
+    df_immo = df_grand_journal[df_grand_journal["Compte"].astype(str).str.startswith("2")].copy()
     
             # Si n'importe quel compte
-    df_immo = df_grand_journal[df_grand_journal['Compte'].str.match(r'^\d+$')].copy()
+    # df_immo = df_grand_journal[df_grand_journal['Compte'].str.match(r'^\d+$')].copy()
     # Vérification debug
     st.write("Nombre de lignes immobilisations :", df_immo.shape[0])
     
@@ -1088,4 +1088,4 @@ if st.button("Traiter") and fichiers:
                 mime="text/csv"
             )
         else:
-            st.info("Aucun amortissement généré (vérifiez vos données).")
+            st.info("Aucun amortissement généré.")
