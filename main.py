@@ -750,7 +750,7 @@ def generer_compte_resultat(df_balance, fichier_sortie="compte_resultat.csv"):
     return df_cr, total_charges, total_produits, resultat_net
 
 
-def generer_annexe(df_grand_livre, fichier_sortie="annexe.csv"):
+def generer_annexe(df_grand_livre, fichier_sortie="annexe.xlsx"):
     """
     Génère une annexe simplifiée à partir du grand livre.
     """
