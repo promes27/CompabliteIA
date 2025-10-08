@@ -26,7 +26,7 @@ CSV_OUTPUT = "grand_journal.csv"
 PDF_PCG = "./plan-comptable-general-2005.pdf"
 
 # OCR et NLP
-reader = easyocr.Reader(['fr', 'en'], gpu=False)
+reader = easyocr.Reader(['fr', 'en'], gpu=False, model_storage_directory='.EasyOCR')
 nlp = spacy.load("fr_core_news_sm")
 
 # OpenAI
