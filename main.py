@@ -750,7 +750,7 @@ def generer_compte_resultat(df_balance, fichier_sortie="compte_resultat.csv"):
     return df_cr, total_charges, total_produits, resultat_net
 
 
-def generer_annexe(df_grand_livre, fichier_sortie="annexe.xlsx"):
+def generer_annexe(df_grand_livre, fichier_sortie="annexe.csv"):
     """
     Génère une annexe simplifiée à partir du grand livre.
     """
@@ -773,11 +773,15 @@ def generer_annexe(df_grand_livre, fichier_sortie="annexe.xlsx"):
     provisions = df_grand_livre[df_grand_livre["Compte"].str.startswith("15")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
 
     # Export CSV
-    with pd.ExcelWriter(fichier_sortie) as writer:
-        immobilisations_detail.to_excel(writer, sheet_name="Immobilisations", index=False)
-        clients.to_excel(writer, sheet_name="Clients", index=False)
-        fournisseurs.to_excel(writer, sheet_name="Fournisseurs", index=False)
-        provisions.to_excel(writer, sheet_name="Provisions", index=False)
+    # with pd.ExcelWriter(fichier_sortie) as writer:
+    #     immobilisations_detail.to_excel(writer, sheet_name="Immobilisations", index=False)
+    #     clients.to_excel(writer, sheet_name="Clients", index=False)
+    #     fournisseurs.to_excel(writer, sheet_name="Fournisseurs", index=False)
+    #     provisions.to_excel(writer, sheet_name="Provisions", index=False)
+    immobilisations_detail.to_csv(os.path.join(fichier_sortie, "immobilisations.csv"), index=False, encoding="utf-8-sig")
+    clients.to_csv(os.path.join(fichier_sortie, "clients.csv"), index=False, encoding="utf-8-sig")
+    fournisseurs.to_csv(os.path.join(fichier_sortie, "fournisseurs.csv"), index=False, encoding="utf-8-sig")
+    provisions.to_csv(os.path.join(fichier_sortie, "provisions.csv"), index=False, encoding="utf-8-sig")
     
     return {
         "Immobilisations": immobilisations_detail,
