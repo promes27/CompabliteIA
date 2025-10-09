@@ -773,10 +773,16 @@ def generer_annexe(df_grand_livre, fichier_sortie="annexe.csv"):
     provisions = df_grand_livre[df_grand_livre["Compte"].str.startswith("15")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
 
     # Export CSV
-    immobilisations_detail.to_csv(os.path.join(fichier_sortie, "immobilisations.csv"), index=False, encoding="utf-8-sig")
-    clients.to_csv(os.path.join(fichier_sortie, "clients.csv"), index=False, encoding="utf-8-sig")
-    fournisseurs.to_csv(os.path.join(fichier_sortie, "fournisseurs.csv"), index=False, encoding="utf-8-sig")
-    provisions.to_csv(os.path.join(fichier_sortie, "provisions.csv"), index=False, encoding="utf-8-sig")
+    # with pd.ExcelWriter(fichier_sortie) as writer:
+    #     immobilisations_detail.to_excel(writer, sheet_name="Immobilisations", index=False)
+    #     clients.to_excel(writer, sheet_name="Clients", index=False)
+    #     fournisseurs.to_excel(writer, sheet_name="Fournisseurs", index=False)
+    #     provisions.to_excel(writer, sheet_name="Provisions", index=False)
+    # Concaténer tout dans un seul DataFrame
+    df_annexe = pd.concat([immobilisations, clients, fournisseurs, provisions], ignore_index=True)
+
+    # Sauvegarde CSV
+    df_annexe.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
     
     return {
         "Immobilisations": immobilisations_detail,
