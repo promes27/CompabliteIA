@@ -288,7 +288,50 @@ Consignes :
     except:
         return pd.DataFrame()
 
+# Verification d'image si une pièce comptable ou non 
+def verifier_image_piece(image_path):
+    """
+    Vérifie si l'image uploadée est bien une pièce comptable
+    (facture, reçu, relevé, etc.).
+    Si ce n’est pas le cas, affiche une alerte et stoppe le traitement.
+    """
+    # Extraire texte via OCR
+    img = preprocess_image(image_path)
+    result = reader.readtext(img)
+    texte = " ".join([t for _, t, _ in result])
+
+    # Si peu de texte, on considère déjà que ce n’est pas une pièce comptable
+    if len(texte.strip()) < 30:
+        st.error("⚠️ Cette image ne semble pas être une pièce comptable (texte illisible ou vide).")
+        st.stop()
+
+    prompt = f"""
+Tu es un expert en comptabilité. 
+Analyse le texte suivant et détermine s'il s'agit d'une pièce comptable (facture, reçu, bon de livraison, relevé, etc.)
+Réponds uniquement par 'oui' ou 'non'.
+
+Texte :
+\"\"\"{texte}\"\"\"
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        reponse = response.choices[0].message.content.strip().lower()
+
+        if not reponse.startswith("oui"):
+            st.error("Cette image ne semble pas être une pièce comptable.")
+            st.stop()
+        else:
+            st.success("Pièce comptable reconnue.")
+    except Exception as e:
+        st.warning(f"Erreur lors de la vérification de la pièce : {e}")
+        st.stop()
+        
 def traiter_image(image_path, pcg_contenu):
+    verifier_image_piece(image_path)
     st.markdown(f"### Traitement : {os.path.basename(image_path)}")
     img = preprocess_image(image_path)
     result = reader.readtext(img)
