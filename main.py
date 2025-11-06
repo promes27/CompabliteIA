@@ -3,6 +3,7 @@ import os
 import re
 import cv2
 import fitz
+import psycopg2
 import pandas as pd
 import easyocr
 import streamlit as st
@@ -15,13 +16,146 @@ from collections import deque
 from PIL import Image
 import io
 import numpy as np
+from psycopg2.extras import execute_values
+import psycopg2
+import os
+
 
 # ==========================
 # CONFIGURATION
 # ==========================
 
 
+# CHARGEMENT VARIABLES .ENV
+# ============================
 load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    print("❌ DATABASE_URL non trouvé dans .env")
+    exit()
+
+# ==========================
+# CRÉATION TABLES + CONNEXION OUVERTE
+# ==========================
+def creer_toutes_les_tables_supabase():
+    """
+    Crée toutes les tables comptables dans Supabase.
+    Retourne la connexion OUVERTE pour réutilisation.
+    """
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
+
+        sql_commands = [
+            """
+            CREATE TABLE IF NOT EXISTS public.grand_journal (
+                id SERIAL PRIMARY KEY,
+                "Date" DATE,
+                "Référence" VARCHAR,
+                "Numéro de compte" VARCHAR,
+                "Libellé" VARCHAR,
+                "Débit (Ar)" DECIMAL(15,2),
+                "Crédit (Ar)" DECIMAL(15,2),
+                "Type journal" VARCHAR,
+                "Fichier source" VARCHAR,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.grand_livre (
+                id SERIAL PRIMARY KEY,
+                "Compte" VARCHAR,
+                "Date" DATE,
+                "Référence" VARCHAR,
+                "Libellé" VARCHAR,
+                "Débit (Ar)" DECIMAL(15,2),
+                "Crédit (Ar)" DECIMAL(15,2),
+                "Solde" DECIMAL(15,2),
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.balance (
+                id SERIAL PRIMARY KEY,
+                "Numéro de compte" VARCHAR UNIQUE,
+                "Débit (Ar)" DECIMAL(15,2),
+                "Crédit (Ar)" DECIMAL(15,2),
+                "Solde Débiteur" DECIMAL(15,2),
+                "Solde Créditeur" DECIMAL(15,2),
+                "Période" VARCHAR(50),
+                derniere_maj TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.lettrage (
+                id SERIAL PRIMARY KEY,
+                "Numéro de compte" VARCHAR,
+                "Date" DATE,
+                "Référence" VARCHAR,
+                "Libellé" VARCHAR,
+                "Débit (Ar)" DECIMAL(15,2),
+                "Crédit (Ar)" DECIMAL(15,2),
+                "Solde partiel" DECIMAL(15,2),
+                "Statut" VARCHAR,
+                "Lettrage" VARCHAR,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.compte_resultat (
+                id SERIAL PRIMARY KEY,
+                "Charges (classe 6)" DECIMAL(15,2),
+                "Produits (classe 7)" DECIMAL(15,2),
+                "Résultat Net" DECIMAL(15,2),
+                periode_debut DATE,
+                periode_fin DATE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.bilan (
+                id SERIAL PRIMARY KEY,
+                "Poste" VARCHAR,
+                "Actif (Ar)" DECIMAL(15,2),
+                "Passif (Ar)" DECIMAL(15,2),
+                date_generation DATE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS public.annexe (
+                id SERIAL PRIMARY KEY,
+                "Compte" VARCHAR,
+                "Date" DATE,
+                "Référence" VARCHAR,
+                "Libellé" VARCHAR,
+                "Débit (Ar)" DECIMAL(15,2),
+                "Crédit (Ar)" DECIMAL(15,2),
+                "Solde" DECIMAL(15,2),
+                "categorie" VARCHAR,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        ]
+
+        for command in sql_commands:
+            cursor.execute(command)
+
+        conn.commit()
+        cursor.close()  # ✅ On ferme seulement le curseur
+        print("✅ Tables créées avec succès dans Supabase")
+        print("✅ Connexion maintenue ouverte pour l'analyse")
+        
+        return conn  # ✅ Retourne la connexion OUVERTE
+
+    except Exception as error:
+        print(f"❌ Erreur création tables : {error}")
+        return None
+
+# ✅ Créer les tables et garder la connexion ouverte
+CONN_SUPABASE = creer_toutes_les_tables_supabase()
+
 CSV_OUTPUT = "grand_journal.csv"
 PDF_PCG = "./plan-comptable-general-2005.pdf"
 
@@ -346,57 +480,143 @@ def traiter_image(image_path, pcg_contenu):
     champs['compte'] = detecter_compte(texte_complet, pcg_contenu)
     champs['journal_markdown'] = generer_journal_avec_llm(texte_complet, pcg_contenu, champs['type_journal'])
     return champs
+# ==========================
+# FONCTION AGRÉGATION AVEC CONNEXION RÉUTILISÉE
+# ==========================
 
-def aggreger_en_grand_journal(donnees, fichier_sortie="grand_journal.csv"):
+
+def aggreger_en_grand_journal(donnees, fichier_sortie="grand_journal.csv", conn_pg=None):
+    """
+    Agrège les données en Grand Journal, exporte en CSV et insère dans PostgreSQL (Supabase).
+    Évite les doublons en vérifiant les pièces déjà insérées.
+    """
     journaux = []
     for ligne in donnees:
         if isinstance(ligne.get("journal_markdown"), pd.DataFrame):
             df_piece = ligne["journal_markdown"].copy()
-            df_piece["Type journal"] = ligne.get("type_journal","inconnu")
-            df_piece["Référence"] = ligne.get("numero_piece","")
+            df_piece["Type journal"] = ligne.get("type_journal", "inconnu")
+            df_piece["Référence"] = ligne.get("numero_piece", "")
+            df_piece["Fichier source"] = ligne.get("fichier", "")
             journaux.append(df_piece)
+
     if not journaux:
+        st.warning("⚠️ Aucune donnée à traiter")
         return pd.DataFrame()
-    
+
+    # ✅ Agrégation
     grand_journal = pd.concat(journaux, ignore_index=True)
-    colonnes = ["Date","Référence","Numéro de compte","Libellé","Débit (Ar)","Crédit (Ar)","Type journal"]
+    colonnes = [
+        "Date", "Référence", "Numéro de compte", "Libellé",
+        "Débit (Ar)", "Crédit (Ar)", "Type journal", "Fichier source"
+    ]
     grand_journal = grand_journal.reindex(columns=colonnes)
-    
-    # Nettoyer les colonnes Débit et Crédit (enlever "Ar", espaces, etc.)
+
+    # ✅ Nettoyage montants
     for col in ["Débit (Ar)", "Crédit (Ar)"]:
         grand_journal[col] = (
             grand_journal[col]
             .astype(str)
-            .str.replace(r"[^\d.,-]", "", regex=True)  # garder seulement chiffres
-            .str.replace(",", ".", regex=False)        # remplacer , par .
+            .str.replace(r"[^\d.,-]", "", regex=True)
+            .str.replace(",", ".", regex=False)
         )
         grand_journal[col] = pd.to_numeric(grand_journal[col], errors="coerce").fillna(0)
 
-    # Normaliser les dates
+    # ✅ Dates
     grand_journal["Date"] = pd.to_datetime(grand_journal["Date"], errors="coerce", dayfirst=True).dt.date
-    
-    # Trier par date
     grand_journal = grand_journal.sort_values(by="Date").reset_index(drop=True)
     grand_journal.index = grand_journal.index + 1
-    
-    # Export CSV
-    grand_journal.to_csv(fichier_sortie,index=False,encoding="utf-8-sig")
-    return grand_journal
 
-def generer_grand_livre(df_grand_journal, fichier_sortie="grand_livre.csv"):
+    # ✅ Export CSV local
+    grand_journal.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+    st.success(f"✅ CSV exporté : {fichier_sortie}")
+
+    # ✅ Insertion PostgreSQL Supabase (si connexion donnée)
+    if conn_pg:
+        try:
+            cursor = conn_pg.cursor()
+
+            # 🔍 Récupérer les pièces déjà insérées dans la BD
+            cursor.execute("""
+                SELECT DISTINCT "Référence", "Fichier source" 
+                FROM grand_journal
+            """)
+            pieces_existantes = set(cursor.fetchall())
+            
+            st.info(f"📊 Pièces déjà en base : {len(pieces_existantes)}")
+
+            # 🆕 Filtrer uniquement les NOUVELLES pièces
+            nouvelles_pieces = []
+            for _, row in grand_journal.iterrows():
+                cle_piece = (str(row["Référence"]), str(row["Fichier source"]))
+                if cle_piece not in pieces_existantes:
+                    nouvelles_pieces.append((
+                        row["Date"] if pd.notna(row["Date"]) else None,
+                        str(row["Référence"]) if pd.notna(row["Référence"]) else "",
+                        str(row["Numéro de compte"]) if pd.notna(row["Numéro de compte"]) else "",
+                        str(row["Libellé"]) if pd.notna(row["Libellé"]) else "",
+                        float(row["Débit (Ar)"]) if pd.notna(row["Débit (Ar)"]) else 0.0,
+                        float(row["Crédit (Ar)"]) if pd.notna(row["Crédit (Ar)"]) else 0.0,
+                        str(row["Type journal"]) if pd.notna(row["Type journal"]) else "inconnu",
+                        str(row["Fichier source"]) if pd.notna(row["Fichier source"]) else ""
+                    ))
+
+            if not nouvelles_pieces:
+                st.warning("⚠️ Aucune nouvelle pièce à insérer (toutes déjà en base)")
+                cursor.close()
+                return grand_journal
+
+            # Compter avant insertion
+            cursor.execute("SELECT COUNT(*) FROM grand_journal")
+            count_avant = cursor.fetchone()[0]
+
+            # ✅ Insertion groupée des NOUVELLES pièces uniquement
+            execute_values(
+                cursor,
+                """
+                INSERT INTO grand_journal 
+                ("Date", "Référence", "Numéro de compte", "Libellé", 
+                 "Débit (Ar)", "Crédit (Ar)", "Type journal", "Fichier source")
+                VALUES %s
+                """,
+                nouvelles_pieces
+            )
+
+            conn_pg.commit()
+
+            # Compter après insertion
+            cursor.execute("SELECT COUNT(*) FROM grand_journal")
+            count_apres = cursor.fetchone()[0]
+            nb_nouvelles = count_apres - count_avant
+
+            st.success(f"✅ {nb_nouvelles} nouvelles écritures insérées → Total en base : {count_apres}")
+            st.info(f"📝 Écritures ignorées (déjà en base) : {len(grand_journal) - nb_nouvelles}")
+
+            cursor.close()
+
+        except Exception as e:
+            conn_pg.rollback()
+            st.error(f"❌ Erreur PostgreSQL : {e}")
+            import traceback
+            st.error(traceback.format_exc())
+
+    return grand_journal
+def generer_grand_livre(df_grand_journal, fichier_sortie="grand_livre.csv", conn_pg=None):
     """
-    Génère le Grand Livre à partir du Grand Journal.
+    Génère le Grand Livre à partir du Grand Journal, exporte en CSV et insère dans PostgreSQL (Supabase).
+    Évite les doublons en vérifiant les entrées déjà insérées.
     """
     if df_grand_journal.empty:
+        st.warning("⚠️ Grand Journal vide")
         return pd.DataFrame()
 
-    # Nettoyer les colonnes Débit et Crédit pour enlever "Ar" et espaces
+    # Nettoyer les colonnes Débit et Crédit
+    df_grand_journal = df_grand_journal.copy()
     for col in ["Débit (Ar)", "Crédit (Ar)"]:
         df_grand_journal[col] = (
             df_grand_journal[col]
             .astype(str)
-            .str.replace(r"[^\d.,-]", "", regex=True)  # garder que chiffres
-            .str.replace(",", ".", regex=False)        # remplacer , par .
+            .str.replace(r"[^\d.,-]", "", regex=True)
+            .str.replace(",", ".", regex=False)
         )
         df_grand_journal[col] = pd.to_numeric(df_grand_journal[col], errors="coerce").fillna(0)
 
@@ -413,28 +633,106 @@ def generer_grand_livre(df_grand_journal, fichier_sortie="grand_livre.csv"):
         grand_livre.append(df_compte)
 
     df_grand_livre = pd.concat(grand_livre, ignore_index=True)
-    colonnes = ["Compte","Date","Référence","Libellé","Débit (Ar)","Crédit (Ar)","Solde"]
+    colonnes = ["Compte", "Date", "Référence", "Libellé", "Débit (Ar)", "Crédit (Ar)", "Solde"]
     df_grand_livre = df_grand_livre.reindex(columns=colonnes)
 
-    # ✅ Version affichage formatée (ex : "200 000 Ar")
-    for col in ["Débit (Ar)", "Crédit (Ar)", "Solde"]:
-        df_grand_livre[col] = df_grand_livre[col].apply(lambda x: f"{int(x):,} Ar".replace(",", " ") if x != 0 else "")
-
-    # Export CSV (avec nombres bruts pour analyse)
-    df_export = pd.concat(grand_livre, ignore_index=True)
-    df_export = df_export.reindex(columns=colonnes)
+    # ✅ Export CSV (avec nombres bruts pour analyse)
+    df_export = df_grand_livre.copy()
     df_export.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+    st.success(f"✅ CSV Grand Livre exporté : {fichier_sortie}")
 
-    return df_grand_livre
+    # ✅ Insertion PostgreSQL Supabase (si connexion donnée)
+    if conn_pg:
+        cursor = None
+        try:
+            cursor = conn_pg.cursor()
 
-def generer_lettrage(df_grand_journal, fichier_sortie="lettrage.csv"):
+            # 🔍 Récupérer les entrées déjà insérées dans la BD
+            cursor.execute("""
+                SELECT DISTINCT "Compte", "Date", "Référence" 
+                FROM grand_livre
+            """)
+            entrees_existantes = set(cursor.fetchall())
+            
+            st.info(f"📊 Entrées déjà en base (Grand Livre) : {len(entrees_existantes)}")
+
+            # 🆕 Filtrer uniquement les NOUVELLES entrées
+            nouvelles_entrees = []
+            for _, row in df_grand_livre.iterrows():
+                cle_entree = (
+                    str(row["Compte"]), 
+                    row["Date"] if pd.notna(row["Date"]) else None,
+                    str(row["Référence"])
+                )
+                if cle_entree not in entrees_existantes:
+                    nouvelles_entrees.append((
+                        str(row["Compte"]) if pd.notna(row["Compte"]) else "",
+                        row["Date"] if pd.notna(row["Date"]) else None,
+                        str(row["Référence"]) if pd.notna(row["Référence"]) else "",
+                        str(row["Libellé"]) if pd.notna(row["Libellé"]) else "",
+                        float(row["Débit (Ar)"]) if pd.notna(row["Débit (Ar)"]) else 0.0,
+                        float(row["Crédit (Ar)"]) if pd.notna(row["Crédit (Ar)"]) else 0.0,
+                        float(row["Solde"]) if pd.notna(row["Solde"]) else 0.0
+                    ))
+
+            if not nouvelles_entrees:
+                st.warning("⚠️ Aucune nouvelle entrée à insérer dans le Grand Livre (toutes déjà en base)")
+            else:
+                # Compter avant insertion
+                cursor.execute("SELECT COUNT(*) FROM grand_livre")
+                count_avant = cursor.fetchone()[0]
+
+                # ✅ Insertion groupée des NOUVELLES entrées uniquement
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO grand_livre 
+                    ("Compte", "Date", "Référence", "Libellé", 
+                     "Débit (Ar)", "Crédit (Ar)", "Solde")
+                    VALUES %s
+                    """,
+                    nouvelles_entrees
+                )
+
+                conn_pg.commit()
+
+                # Compter après insertion
+                cursor.execute("SELECT COUNT(*) FROM grand_livre")
+                count_apres = cursor.fetchone()[0]
+                nb_nouvelles = count_apres - count_avant
+
+                st.success(f"✅ {nb_nouvelles} nouvelles entrées insérées dans le Grand Livre → Total en base : {count_apres}")
+                st.info(f"📝 Entrées ignorées (déjà en base) : {len(df_grand_livre) - nb_nouvelles}")
+
+        except Exception as e:
+            conn_pg.rollback()
+            st.error(f"❌ Erreur PostgreSQL Grand Livre : {e}")
+            import traceback
+            st.error(traceback.format_exc())
+        
+        finally:
+            if cursor:
+                cursor.close()
+
+    # ✅ Version affichage formatée (ex : "200 000 Ar")
+    df_grand_livre_affichage = df_grand_livre.copy()
+    for col in ["Débit (Ar)", "Crédit (Ar)", "Solde"]:
+        df_grand_livre_affichage[col] = df_grand_livre_affichage[col].apply(
+            lambda x: f"{int(x):,} Ar".replace(",", " ") if x != 0 else ""
+        )
+
+    return df_grand_livre_affichage
+
+def generer_lettrage(df_grand_journal, fichier_sortie="lettrage.csv", conn_pg=None):
     """
     Rapproche débits/crédits par compte (lettrage).
+    Exporte en CSV et insère dans PostgreSQL (Supabase).
     - supporte lettrage exact et partiel (fractionnement logique).
     - retourne un dataframe avec colonnes: Numéro de compte, Date, Référence, Libellé,
       Débit (Ar), Crédit (Ar), Solde partiel, Statut, Lettrage
     """
     if df_grand_journal is None or df_grand_journal.empty:
+        st.warning("⚠️ Grand Journal vide")
         return pd.DataFrame()
 
     df = df_grand_journal.copy()
@@ -468,7 +766,7 @@ def generer_lettrage(df_grand_journal, fichier_sortie="lettrage.csv"):
         df_c["abs_amount"] = df_c["amount"].abs()
         df_c["sign"] = df_c["amount"].apply(lambda x: "D" if x > 0 else ("C" if x < 0 else "0"))
         df_c["remaining"] = df_c["abs_amount"].copy()
-        df_c["Lettrage"] = ""  # on stockera des id L1;L2...
+        df_c["Lettrage"] = ""
         
         # files: debit queue (positive), credit queue (positive absolut)
         deb_q = deque([(i, row["remaining"]) for i, row in df_c[df_c["sign"] == "D"].iterrows()])
@@ -483,7 +781,6 @@ def generer_lettrage(df_grand_journal, fichier_sortie="lettrage.csv"):
             # tolérance (par sécurité float)
             if abs(i_amt - j_amt) < 1e-6:
                 tag = f"L{let_idx}"
-                # append tag
                 df_c.at[i_idx, "Lettrage"] = (df_c.at[i_idx, "Lettrage"] + ";" + tag) if df_c.at[i_idx, "Lettrage"] else tag
                 df_c.at[j_idx, "Lettrage"] = (df_c.at[j_idx, "Lettrage"] + ";" + tag) if df_c.at[j_idx, "Lettrage"] else tag
                 df_c.at[i_idx, "remaining"] = 0
@@ -495,7 +792,6 @@ def generer_lettrage(df_grand_journal, fichier_sortie="lettrage.csv"):
                 df_c.at[j_idx, "remaining"] = 0
                 new_i = i_amt - j_amt
                 df_c.at[i_idx, "remaining"] = new_i
-                # remettre le débit restant en tête (on continue à le rapprocher)
                 deb_q.appendleft((i_idx, new_i))
                 let_idx += 1
             else:  # i_amt < j_amt
@@ -543,10 +839,88 @@ def generer_lettrage(df_grand_journal, fichier_sortie="lettrage.csv"):
             df_out[c] = ""
 
     df_out = df_out[colonnes]
+    
+    # ✅ Export CSV
     df_out.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+    st.success(f"✅ CSV Lettrage exporté : {fichier_sortie}")
+
+    # ✅ Insertion PostgreSQL Supabase (si connexion donnée)
+    if conn_pg:
+        cursor = None
+        try:
+            cursor = conn_pg.cursor()
+
+            # 🔍 Récupérer les entrées déjà insérées dans la BD
+            cursor.execute("""
+                SELECT DISTINCT "Numéro de compte", "Date", "Référence", "Lettrage"
+                FROM lettrage
+            """)
+            entrees_existantes = set(cursor.fetchall())
+            
+            st.info(f"📊 Entrées déjà en base (Lettrage) : {len(entrees_existantes)}")
+
+            # 🆕 Filtrer uniquement les NOUVELLES entrées
+            nouvelles_entrees = []
+            for _, row in df_out.iterrows():
+                cle_entree = (
+                    str(row["Numéro de compte"]),
+                    row["Date"] if pd.notna(row["Date"]) else None,
+                    str(row["Référence"]),
+                    str(row["Lettrage"])
+                )
+                if cle_entree not in entrees_existantes:
+                    nouvelles_entrees.append((
+                        str(row["Numéro de compte"]) if pd.notna(row["Numéro de compte"]) else "",
+                        row["Date"] if pd.notna(row["Date"]) else None,
+                        str(row["Référence"]) if pd.notna(row["Référence"]) else "",
+                        str(row["Libellé"]) if pd.notna(row["Libellé"]) else "",
+                        float(row["Débit (Ar)"]) if pd.notna(row["Débit (Ar)"]) else 0.0,
+                        float(row["Crédit (Ar)"]) if pd.notna(row["Crédit (Ar)"]) else 0.0,
+                        float(row["Solde partiel"]) if pd.notna(row["Solde partiel"]) else 0.0,
+                        str(row["Statut"]) if pd.notna(row["Statut"]) else "",
+                        str(row["Lettrage"]) if pd.notna(row["Lettrage"]) else ""
+                    ))
+
+            if not nouvelles_entrees:
+                st.warning("⚠️ Aucune nouvelle entrée à insérer dans le Lettrage (toutes déjà en base)")
+            else:
+                # Compter avant insertion
+                cursor.execute("SELECT COUNT(*) FROM lettrage")
+                count_avant = cursor.fetchone()[0]
+
+                # ✅ Insertion groupée des NOUVELLES entrées uniquement
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO lettrage 
+                    ("Numéro de compte", "Date", "Référence", "Libellé", 
+                     "Débit (Ar)", "Crédit (Ar)", "Solde partiel", "Statut", "Lettrage")
+                    VALUES %s
+                    """,
+                    nouvelles_entrees
+                )
+
+                conn_pg.commit()
+
+                # Compter après insertion
+                cursor.execute("SELECT COUNT(*) FROM lettrage")
+                count_apres = cursor.fetchone()[0]
+                nb_nouvelles = count_apres - count_avant
+
+                st.success(f"✅ {nb_nouvelles} nouvelles entrées insérées dans le Lettrage → Total en base : {count_apres}")
+                st.info(f"📝 Entrées ignorées (déjà en base) : {len(df_out) - nb_nouvelles}")
+
+        except Exception as e:
+            conn_pg.rollback()
+            st.error(f"❌ Erreur PostgreSQL Lettrage : {e}")
+            import traceback
+            st.error(traceback.format_exc())
+        
+        finally:
+            if cursor:
+                cursor.close()
+
     return df_out
-
-
 # =====================
 # Rapprochement bancaire
 # =====================
@@ -598,13 +972,12 @@ def rapprochement_bancaire(df_journal, df_releve, seuil_jours=3, seuil_montant=1
         df_releve.rename(columns={"Libellé":"Libellé_releve"})[["Date","Libellé_releve","Montant","Statut"]]
     ], axis=1)
     return df_result
+# a partir de ici , y a encore des code a rectifier 
 
-
-import pandas as pd
-
-def generer_balance(df_grand_journal, fichier_sortie="balance.csv"):
+def generer_balance(df_grand_journal, fichier_sortie="balance.csv", conn_pg=None):
     """
     Génère la balance comptable à partir du Grand Journal.
+    Exporte en CSV et insère/met à jour dans PostgreSQL (Supabase).
     Retourne un DataFrame avec :
     - Numéro de compte
     - Débit total
@@ -614,6 +987,7 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv"):
     """
 
     if df_grand_journal.empty:
+        st.warning("⚠️ Grand Journal vide")
         return pd.DataFrame()
 
     df = df_grand_journal.copy()
@@ -628,8 +1002,8 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv"):
     for col in ["Débit (Ar)", "Crédit (Ar)"]:
         df[col] = (
             df[col].astype(str)
-            .str.replace(r"[^\d\-,.]", "", regex=True)   # garder seulement chiffres, signe, point, virgule
-            .str.replace(",", ".", regex=False)         # uniformiser les décimales
+            .str.replace(r"[^\d\-,.]", "", regex=True)
+            .str.replace(",", ".", regex=False)
         )
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
@@ -643,16 +1017,73 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv"):
     df_balance["Solde"] = df_balance["Débit (Ar)"] - df_balance["Crédit (Ar)"]
     df_balance["Solde Débiteur"] = df_balance["Solde"].apply(lambda x: x if x > 0 else 0)
     df_balance["Solde Créditeur"] = df_balance["Solde"].apply(lambda x: -x if x < 0 else 0)
-    df_balance.drop(columns=["Solde"], inplace=True)
+    
+    # ✅ Garder une copie avec valeurs numériques pour Supabase
+    df_balance_numeric = df_balance.copy()
+    df_balance_numeric.drop(columns=["Solde"], inplace=True)
 
-    # Formatage en Ar
+    # ✅ Export CSV (valeurs numériques brutes)
+    df_balance_numeric.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+    st.success(f"✅ CSV Balance exporté : {fichier_sortie}")
+
+    # ✅ Insertion/Mise à jour PostgreSQL Supabase (si connexion donnée)
+    if conn_pg:
+        cursor = None
+        try:
+            cursor = conn_pg.cursor()
+
+            st.info(f"📊 Mise à jour de la balance dans Supabase...")
+
+            # 🔄 Pour chaque compte, on fait un UPSERT (INSERT ou UPDATE)
+            for _, row in df_balance_numeric.iterrows():
+                compte = str(row["Numéro de compte"])
+                debit = float(row["Débit (Ar)"])
+                credit = float(row["Crédit (Ar)"])
+                solde_deb = float(row["Solde Débiteur"])
+                solde_cred = float(row["Solde Créditeur"])
+
+                # ✅ UPSERT : INSERT ou UPDATE si le compte existe déjà
+                cursor.execute("""
+                    INSERT INTO balance 
+                    ("Numéro de compte", "Débit (Ar)", "Crédit (Ar)", 
+                     "Solde Débiteur", "Solde Créditeur", derniere_maj)
+                    VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT ("Numéro de compte") 
+                    DO UPDATE SET
+                        "Débit (Ar)" = EXCLUDED."Débit (Ar)",
+                        "Crédit (Ar)" = EXCLUDED."Crédit (Ar)",
+                        "Solde Débiteur" = EXCLUDED."Solde Débiteur",
+                        "Solde Créditeur" = EXCLUDED."Solde Créditeur",
+                        derniere_maj = CURRENT_TIMESTAMP
+                """, (compte, debit, credit, solde_deb, solde_cred))
+
+            conn_pg.commit()
+
+            # Compter total en base
+            cursor.execute("SELECT COUNT(*) FROM balance")
+            total = cursor.fetchone()[0]
+
+            st.success(f"✅ Balance mise à jour dans Supabase → {total} comptes en base")
+
+        except Exception as e:
+            conn_pg.rollback()
+            st.error(f"❌ Erreur PostgreSQL Balance : {e}")
+            import traceback
+            st.error(traceback.format_exc())
+        
+        finally:
+            if cursor:
+                cursor.close()
+
+    # ✅ Formatage pour affichage (après insertion Supabase)
+    df_balance_affichage = df_balance_numeric.copy()
     for col in ["Débit (Ar)", "Crédit (Ar)", "Solde Débiteur", "Solde Créditeur"]:
-        df_balance[col] = df_balance[col].apply(lambda x: f"{int(x):,} Ar".replace(",", " "))
+        df_balance_affichage[col] = df_balance_affichage[col].apply(
+            lambda x: f"{int(x):,} Ar".replace(",", " ") if x != 0 else ""
+        )
 
-    # Export CSV
-    df_balance.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+    return df_balance_affichage
 
-    return df_balance
 
 def parse_montant(val):
     """
@@ -669,15 +1100,14 @@ def parse_montant(val):
         return float(val)
     except ValueError:
         return 0.0
-    
-def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv"):
+def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv", conn_pg=None):
     """
     Génère un bilan simplifié (Actif / Passif) à partir de la balance fournie.
-    df_balance_brut : DataFrame retourné par generer_balance (colonnes Débit (Ar), Crédit (Ar))
-    Retour : DataFrame du bilan (Actif / Passif) et sauvegarde CSV.
+    Exporte en CSV et insère dans PostgreSQL (Supabase) SANS supprimer l'ancien.
     """
     if df_balance_brut is None or df_balance_brut.empty:
-        return pd.DataFrame()
+        st.warning("⚠️ Balance vide")
+        return pd.DataFrame(), 0, 0
 
     df = df_balance_brut.copy()
 
@@ -689,7 +1119,7 @@ def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv"):
     # Convertir en numérique
     df["_debit_num"] = df["Débit (Ar)"].apply(parse_montant)
     df["_credit_num"] = df["Crédit (Ar)"].apply(parse_montant)
-    df["_net"] = df["_debit_num"] - df["_credit_num"]  # positif = Actif, négatif = Passif
+    df["_net"] = df["_debit_num"] - df["_credit_num"]
 
     # Classification simple par préfixe
     def classifier_compte(numero):
@@ -745,24 +1175,77 @@ def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv"):
         "Actif (Ar)": total_actif,
         "Passif (Ar)": total_passif
     }])
-    df_bilan_aff = pd.concat([df_bilan, totals_row], ignore_index=True)
+    
+    df_bilan_numeric = pd.concat([df_bilan, totals_row], ignore_index=True)
 
-    # Mise en forme
-    df_bilan_aff["Actif (Ar)"] = df_bilan_aff["Actif (Ar)"].apply(lambda x: f"{int(round(x)):,}".replace(",", " ") + " Ar" if x != 0 else "")
-    df_bilan_aff["Passif (Ar)"] = df_bilan_aff["Passif (Ar)"].apply(lambda x: f"{int(round(x)):,}".replace(",", " ") + " Ar" if x != 0 else "")
+    # ✅ Export CSV
+    df_bilan_numeric.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+    st.success(f"✅ CSV Bilan exporté : {fichier_sortie}")
 
-    # Sauvegarde CSV
-    df_bilan_aff.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+    # ✅ Insertion PostgreSQL Supabase SANS SUPPRESSION
+    if conn_pg:
+        cursor = None
+        try:
+            cursor = conn_pg.cursor()
+
+            st.info(f"📊 Insertion du bilan dans Supabase (historique conservé)...")
+
+            # ✅ INSERTION DIRECTE sans DELETE
+            nouvelles_entrees = []
+            for _, row in df_bilan_numeric.iterrows():
+                nouvelles_entrees.append((
+                    str(row["Poste"]),
+                    float(row["Actif (Ar)"]) if row["Actif (Ar)"] != 0 else 0.0,
+                    float(row["Passif (Ar)"]) if row["Passif (Ar)"] != 0 else 0.0,
+                    pd.Timestamp.now()  # date_generation avec heure précise
+                ))
+
+            execute_values(
+                cursor,
+                """
+                INSERT INTO bilan 
+                ("Poste", "Actif (Ar)", "Passif (Ar)", date_generation)
+                VALUES %s
+                """,
+                nouvelles_entrees
+            )
+
+            conn_pg.commit()
+
+            # Compter total en base
+            cursor.execute("SELECT COUNT(*) FROM bilan")
+            total = cursor.fetchone()[0]
+
+            st.success(f"✅ Bilan inséré dans Supabase → Total bilans historisés : {total}")
+
+        except Exception as e:
+            conn_pg.rollback()
+            st.error(f"❌ Erreur PostgreSQL Bilan : {e}")
+            import traceback
+            st.error(traceback.format_exc())
+        
+        finally:
+            if cursor:
+                cursor.close()
+
+    # Mise en forme pour affichage
+    df_bilan_aff = df_bilan_numeric.copy()
+    df_bilan_aff["Actif (Ar)"] = df_bilan_aff["Actif (Ar)"].apply(
+        lambda x: f"{int(round(x)):,}".replace(",", " ") + " Ar" if x != 0 else ""
+    )
+    df_bilan_aff["Passif (Ar)"] = df_bilan_aff["Passif (Ar)"].apply(
+        lambda x: f"{int(round(x)):,}".replace(",", " ") + " Ar" if x != 0 else ""
+    )
 
     return df_bilan_aff, total_actif, total_passif
-
-
-def generer_compte_resultat(df_balance, fichier_sortie="compte_resultat.csv"):
+def generer_compte_resultat(df_balance, fichier_sortie="compte_resultat.csv", conn_pg=None):
     """
     Génère un compte de résultat simplifié (Charges / Produits).
+    Exporte en CSV et insère dans PostgreSQL (Supabase) SANS supprimer l'ancien.
     """
     if df_balance is None or df_balance.empty:
-        return pd.DataFrame()
+        st.warning("⚠️ Balance vide")
+        return pd.DataFrame(), 0, 0, 0
 
     df = df_balance.copy()
 
@@ -778,7 +1261,51 @@ def generer_compte_resultat(df_balance, fichier_sortie="compte_resultat.csv"):
     total_produits = produits["_credit_num"].sum()
     resultat_net = total_produits - total_charges
 
-    # Préparer tableau résultat
+    df_cr_numeric = pd.DataFrame({
+        "Charges (classe 6)": [total_charges],
+        "Produits (classe 7)": [total_produits],
+        "Résultat Net": [resultat_net]
+    })
+
+    # ✅ Export CSV
+    df_cr_numeric.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+    st.success(f"✅ CSV Compte de Résultat exporté : {fichier_sortie}")
+
+    # ✅ Insertion PostgreSQL Supabase SANS SUPPRESSION
+    if conn_pg:
+        cursor = None
+        try:
+            cursor = conn_pg.cursor()
+
+            st.info(f"📊 Insertion du compte de résultat dans Supabase (historique conservé)...")
+
+            # ✅ INSERTION DIRECTE sans DELETE
+            cursor.execute("""
+                INSERT INTO compte_resultat 
+                ("Charges (classe 6)", "Produits (classe 7)", "Résultat Net", 
+                 periode_debut, periode_fin)
+                VALUES (%s, %s, %s, CURRENT_DATE, CURRENT_DATE)
+            """, (float(total_charges), float(total_produits), float(resultat_net)))
+
+            conn_pg.commit()
+
+            # Compter total en base
+            cursor.execute("SELECT COUNT(*) FROM compte_resultat")
+            total = cursor.fetchone()[0]
+
+            st.success(f"✅ Compte de Résultat inséré → Total analyses historisées : {total}")
+
+        except Exception as e:
+            conn_pg.rollback()
+            st.error(f"❌ Erreur PostgreSQL Compte de Résultat : {e}")
+            import traceback
+            st.error(traceback.format_exc())
+        
+        finally:
+            if cursor:
+                cursor.close()
+
+    # Préparer tableau résultat formaté
     data = {
         "Charges (classe 6)": [f"{int(round(total_charges)):,}".replace(",", " ") + " Ar"],
         "Produits (classe 7)": [f"{int(round(total_produits)):,}".replace(",", " ") + " Ar"],
@@ -787,12 +1314,7 @@ def generer_compte_resultat(df_balance, fichier_sortie="compte_resultat.csv"):
 
     df_cr = pd.DataFrame(data)
 
-    # Export CSV
-    df_cr.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
-
     return df_cr, total_charges, total_produits, resultat_net
-
-
 def generer_annexe(df_grand_livre, fichier_sortie="annexe.csv"):
     """
     Génère une annexe simplifiée à partir du grand livre.
@@ -943,7 +1465,8 @@ if st.button("Traiter") and fichiers:
     if donnees:
         df = pd.DataFrame(donnees)
         df = detecter_doublons(df)
-        st.session_state.df_final = aggreger_en_grand_journal(donnees, CSV_OUTPUT)
+        st.session_state.df_final = aggreger_en_grand_journal(donnees, CSV_OUTPUT,
+            conn_pg=CONN_SUPABASE )
         st.success(f"✅ Extraction terminée, exporté dans {CSV_OUTPUT}")
 
         types_dispo = st.session_state.df_final["Type journal"].unique().tolist()
@@ -963,7 +1486,8 @@ if st.button("Traiter") and fichiers:
         )
 
         st.markdown("<h4> Grand Livre </h4>", unsafe_allow_html=True)
-        df_grand_livre = generer_grand_livre(st.session_state.df_final, "grand_livre.csv")
+        df_grand_livre = generer_grand_livre(st.session_state.df_final, "grand_livre.csv",
+            conn_pg=CONN_SUPABASE)
         st.dataframe(df_grand_livre)
         st.download_button(
             "⬇️ Télécharger le Grand Livre",
@@ -976,7 +1500,7 @@ if st.button("Traiter") and fichiers:
         st.markdown("<h4>Lettrage des comptes</h4>", unsafe_allow_html=True)
 
         # Génération du lettrage à partir du grand journal final
-        df_lettrage = generer_lettrage(st.session_state.df_final, "lettrage.csv")
+        df_lettrage = generer_lettrage(st.session_state.df_final, "lettrage.csv",conn_pg=CONN_SUPABASE )
 
         # Affichage dans Streamlit
         st.dataframe(
@@ -1029,7 +1553,8 @@ if st.button("Traiter") and fichiers:
     st.markdown("<h4>Balance comptable</h4>", unsafe_allow_html=True)
 
     # Balance brute (avec nombres pour export CSV)
-    df_balance_brut = generer_balance(st.session_state.df_final, "balance.csv")
+    df_balance_brut = generer_balance(st.session_state.df_final, "balance.csv",
+    conn_pg=CONN_SUPABASE )
 
     # Créer une copie formatée pour affichage
     df_balance_affichage = df_balance_brut.copy()
@@ -1051,7 +1576,7 @@ if st.button("Traiter") and fichiers:
 
 
     # Générer le bilan
-    df_bilan, tot_actif, tot_passif = generer_bilan(df_balance_brut, "bilan.csv")
+    df_bilan, tot_actif, tot_passif = generer_bilan(df_balance_brut, "bilan.csv",conn_pg=CONN_SUPABASE)
 
     st.markdown("<h4 style='margin-top:20px;'>📊 Bilan simplifié</h4>", unsafe_allow_html=True)
 
@@ -1079,7 +1604,8 @@ if st.button("Traiter") and fichiers:
 
     st.markdown("<h3 style='margin-top:30px;'>📗 Compte de Résultat</h3>", unsafe_allow_html=True)
 
-    df_cr, total_charges, total_produits, resultat_net = generer_compte_resultat(df_balance_brut, "compte_resultat.csv")
+    df_cr, total_charges, total_produits, resultat_net = generer_compte_resultat(df_balance_brut, "compte_resultat.csv",
+    conn_pg=CONN_SUPABASE )
 
     if df_cr is not None and not df_cr.empty:
         st.dataframe(df_cr, use_container_width=True)
