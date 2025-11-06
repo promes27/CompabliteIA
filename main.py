@@ -19,6 +19,7 @@ import numpy as np
 from psycopg2.extras import execute_values
 import psycopg2
 import os
+import hashlib
 
 
 # ==========================
@@ -78,6 +79,7 @@ def creer_toutes_les_tables_supabase():
             """
             CREATE TABLE IF NOT EXISTS public.balance (
                 id SERIAL PRIMARY KEY,
+                "Libellé " TEXT,
                 "Numéro de compte" VARCHAR UNIQUE,
                 "Débit (Ar)" DECIMAL(15,2),
                 "Crédit (Ar)" DECIMAL(15,2),
@@ -120,6 +122,7 @@ def creer_toutes_les_tables_supabase():
                 "Actif (Ar)" DECIMAL(15,2),
                 "Passif (Ar)" DECIMAL(15,2),
                 date_generation DATE,
+                file_hash VARCHAR(32),
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
             """,
@@ -972,18 +975,12 @@ def rapprochement_bancaire(df_journal, df_releve, seuil_jours=3, seuil_montant=1
         df_releve.rename(columns={"Libellé":"Libellé_releve"})[["Date","Libellé_releve","Montant","Statut"]]
     ], axis=1)
     return df_result
-# a partir de ici , y a encore des code a rectifier 
-
+# a partir de ici , y a encore des code a rectifier
 def generer_balance(df_grand_journal, fichier_sortie="balance.csv", conn_pg=None):
     """
     Génère la balance comptable à partir du Grand Journal.
     Exporte en CSV et insère/met à jour dans PostgreSQL (Supabase).
-    Retourne un DataFrame avec :
-    - Numéro de compte
-    - Débit total
-    - Crédit total
-    - Solde Débiteur
-    - Solde Créditeur
+    Inclut le libellé de la dernière écriture pour chaque compte.
     """
 
     if df_grand_journal.empty:
@@ -996,7 +993,7 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv", conn_pg=None
     colonnes_attendues = ["Numéro de compte", "Débit (Ar)", "Crédit (Ar)"]
     for col in colonnes_attendues:
         if col not in df.columns:
-            raise ValueError(f"Colonne manquante dans le fichier : {col}")
+            raise ValueError(f"Colonne manquante : {col}")
 
     # Nettoyage colonnes numériques
     for col in ["Débit (Ar)", "Crédit (Ar)"]:
@@ -1007,10 +1004,11 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv", conn_pg=None
         )
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Grouper par compte
+    # ✅ Grouper par compte avec agrégation pour récupérer le libellé
     df_balance = df.groupby("Numéro de compte", as_index=False).agg({
         "Débit (Ar)": "sum",
-        "Crédit (Ar)": "sum"
+        "Crédit (Ar)": "sum",
+        "Libellé": "last"  # ✅ Prend le dernier libellé pour ce compte
     })
 
     # Calcul solde et séparation Débiteur/Créditeur
@@ -1018,44 +1016,67 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv", conn_pg=None
     df_balance["Solde Débiteur"] = df_balance["Solde"].apply(lambda x: x if x > 0 else 0)
     df_balance["Solde Créditeur"] = df_balance["Solde"].apply(lambda x: -x if x < 0 else 0)
     
-    # ✅ Garder une copie avec valeurs numériques pour Supabase
-    df_balance_numeric = df_balance.copy()
-    df_balance_numeric.drop(columns=["Solde"], inplace=True)
+    # ✅ Ajouter période (jour/mois/année actuel)
+    periode_actuelle = pd.Timestamp.now().strftime("%Y-%m-%d")  # Format: 2025-01
+    df_balance["Période"] = periode_actuelle
+
+    # ✅ Réorganiser colonnes
+    df_balance_numeric = df_balance[[
+        "Numéro de compte", 
+        "Libellé",
+        "Débit (Ar)", 
+        "Crédit (Ar)", 
+        "Solde Débiteur", 
+        "Solde Créditeur",
+        "Période"
+    ]].copy()
 
     # ✅ Export CSV (valeurs numériques brutes)
     df_balance_numeric.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
     st.success(f"✅ CSV Balance exporté : {fichier_sortie}")
 
-    # ✅ Insertion/Mise à jour PostgreSQL Supabase (si connexion donnée)
+    # Calcul total pour vérification
+    total_debit = df_balance_numeric["Débit (Ar)"].sum()
+    total_credit = df_balance_numeric["Crédit (Ar)"].sum()
+    
+    if abs(total_debit - total_credit) < 0.01:
+        st.success(f"✅ Balance équilibrée : {total_debit:,.2f} Ar")
+    else:
+        st.warning(f"⚠️ Balance déséquilibrée : Débit={total_debit:,.2f} Ar, Crédit={total_credit:,.2f} Ar")
+
+    # ✅ Insertion/Mise à jour PostgreSQL Supabase
     if conn_pg:
         cursor = None
         try:
             cursor = conn_pg.cursor()
 
-            st.info(f"📊 Mise à jour de la balance dans Supabase...")
+            st.info(f"📊 Synchronisation avec Supabase...")
 
-            # 🔄 Pour chaque compte, on fait un UPSERT (INSERT ou UPDATE)
+            # 🔄 UPSERT pour chaque compte
             for _, row in df_balance_numeric.iterrows():
                 compte = str(row["Numéro de compte"])
+                libelle = str(row["Libellé"]) if pd.notna(row["Libellé"]) else ""
                 debit = float(row["Débit (Ar)"])
                 credit = float(row["Crédit (Ar)"])
                 solde_deb = float(row["Solde Débiteur"])
                 solde_cred = float(row["Solde Créditeur"])
+                periode = str(row["Période"])
 
-                # ✅ UPSERT : INSERT ou UPDATE si le compte existe déjà
                 cursor.execute("""
                     INSERT INTO balance 
-                    ("Numéro de compte", "Débit (Ar)", "Crédit (Ar)", 
-                     "Solde Débiteur", "Solde Créditeur", derniere_maj)
-                    VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ("Numéro de compte", "Libellé ", "Débit (Ar)", "Crédit (Ar)", 
+                     "Solde Débiteur", "Solde Créditeur", "Période", derniere_maj)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     ON CONFLICT ("Numéro de compte") 
                     DO UPDATE SET
+                        "Libellé " = EXCLUDED."Libellé ",
                         "Débit (Ar)" = EXCLUDED."Débit (Ar)",
                         "Crédit (Ar)" = EXCLUDED."Crédit (Ar)",
                         "Solde Débiteur" = EXCLUDED."Solde Débiteur",
                         "Solde Créditeur" = EXCLUDED."Solde Créditeur",
+                        "Période" = EXCLUDED."Période",
                         derniere_maj = CURRENT_TIMESTAMP
-                """, (compte, debit, credit, solde_deb, solde_cred))
+                """, (compte, libelle, debit, credit, solde_deb, solde_cred, periode))
 
             conn_pg.commit()
 
@@ -1063,7 +1084,7 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv", conn_pg=None
             cursor.execute("SELECT COUNT(*) FROM balance")
             total = cursor.fetchone()[0]
 
-            st.success(f"✅ Balance mise à jour dans Supabase → {total} comptes en base")
+            st.success(f"✅ Balance synchronisée avec Supabase → {total} comptes en base")
 
         except Exception as e:
             conn_pg.rollback()
@@ -1077,14 +1098,13 @@ def generer_balance(df_grand_journal, fichier_sortie="balance.csv", conn_pg=None
 
     # ✅ Formatage pour affichage (après insertion Supabase)
     df_balance_affichage = df_balance_numeric.copy()
+    
     for col in ["Débit (Ar)", "Crédit (Ar)", "Solde Débiteur", "Solde Créditeur"]:
         df_balance_affichage[col] = df_balance_affichage[col].apply(
-            lambda x: f"{int(x):,} Ar".replace(",", " ") if x != 0 else ""
+            lambda x: f"{int(x):,} Ar".replace(",", " ") if pd.notna(x) and x != 0 else ""
         )
 
     return df_balance_affichage
-
-
 def parse_montant(val):
     """
     Convertit un montant (ex: '1 200,50 Ar') en float.
@@ -1103,60 +1123,130 @@ def parse_montant(val):
 def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv", conn_pg=None):
     """
     Génère un bilan simplifié (Actif / Passif) à partir de la balance fournie.
-    Exporte en CSV et insère dans PostgreSQL (Supabase) SANS supprimer l'ancien.
+    Exporte en CSV et insère dans PostgreSQL (Supabase) avec détection de doublons.
+    
+    ✅ Utilise un hash MD5 du fichier pour éviter les réinsertions du même fichier
+    
+    Parameters:
+    -----------
+    df_balance_brut : pd.DataFrame
+        DataFrame contenant la balance avec colonnes : 
+        "Numéro de compte", "Débit (Ar)", "Crédit (Ar)"
+    fichier_sortie : str
+        Chemin du fichier CSV de sortie
+    conn_pg : psycopg2.connection
+        Connexion PostgreSQL/Supabase (optionnel)
+    
+    Returns:
+    --------
+    tuple : (df_bilan_affichage, total_actif, total_passif)
     """
+    
+    # ═══════════════════════════════════════════════════════════
+    # 1. VALIDATION DES DONNÉES
+    # ═══════════════════════════════════════════════════════════
     if df_balance_brut is None or df_balance_brut.empty:
-        st.warning("⚠️ Balance vide")
+        st.warning("⚠️ Balance vide, impossible de générer le bilan")
         return pd.DataFrame(), 0, 0
 
     df = df_balance_brut.copy()
 
-    # Vérifier colonnes
+    # ═══════════════════════════════════════════════════════════
+    # 2. CALCUL DU HASH UNIQUE DU FICHIER
+    # ═══════════════════════════════════════════════════════════
+    file_hash = None
+    try:
+        # Colonnes essentielles pour identifier le fichier de manière unique
+        colonnes_hash = ["Numéro de compte", "Débit (Ar)", "Crédit (Ar)"]
+        
+        # Vérifier que les colonnes existent
+        colonnes_disponibles = [col for col in colonnes_hash if col in df.columns]
+        
+        if not colonnes_disponibles:
+            st.error("❌ Colonnes nécessaires introuvables pour calculer le hash")
+        else:
+            # Sérialiser les données en JSON puis calculer MD5
+            data_to_hash = df[colonnes_disponibles].to_json(
+                orient='records', 
+                force_ascii=False,
+                default_handler=str  # Gère les types non-JSON
+            )
+            file_hash = hashlib.md5(data_to_hash.encode('utf-8')).hexdigest()
+            st.info(f"🔐 Empreinte du fichier : `{file_hash[:12]}...`")
+    
+    except Exception as e:
+        st.error(f"❌ Erreur lors du calcul du hash : {e}")
+        st.warning("⚠️ Le système continuera sans détection de doublons")
+
+    # ═══════════════════════════════════════════════════════════
+    # 3. PRÉPARATION DES COLONNES
+    # ═══════════════════════════════════════════════════════════
     for col in ["Débit (Ar)", "Crédit (Ar)"]:
         if col not in df.columns:
             df[col] = ""
+            st.warning(f"⚠️ Colonne '{col}' manquante, initialisée à vide")
 
-    # Convertir en numérique
+    # ═══════════════════════════════════════════════════════════
+    # 4. CONVERSION DES MONTANTS EN NUMÉRIQUE
+    # ═══════════════════════════════════════════════════════════
     df["_debit_num"] = df["Débit (Ar)"].apply(parse_montant)
     df["_credit_num"] = df["Crédit (Ar)"].apply(parse_montant)
     df["_net"] = df["_debit_num"] - df["_credit_num"]
 
-    # Classification simple par préfixe
+    # ═══════════════════════════════════════════════════════════
+    # 5. CLASSIFICATION DES COMPTES PAR POSTE
+    # ═══════════════════════════════════════════════════════════
     def classifier_compte(numero):
+        """
+        Classifie un numéro de compte selon le plan comptable OHADA/PCG
+        """
         n = str(numero).strip()
         if not n:
             return "Non classé"
+        
+        # ACTIF
         if n.startswith("2"):
             return "Actif immobilisé"
         if n.startswith("3"):
             return "Stocks"
         if n.startswith("41") or n.startswith("46"):
             return "Créances clients et divers"
-        if n.startswith("40") or n.startswith("42") or n.startswith("44"):
-            return "Dettes fournisseurs / Tiers"
         if n.startswith("5") or n.startswith("53") or n.startswith("512"):
             return "Disponibilités (Banque / Caisse)"
+        
+        # PASSIF
         if n.startswith("1"):
             return "Capitaux propres et assimilés"
         if n.startswith("16") or n.startswith("17") or n.startswith("19"):
             return "Emprunts et dettes financières"
+        if n.startswith("40") or n.startswith("42") or n.startswith("44"):
+            return "Dettes fournisseurs / Tiers"
+        
         return "Autres"
 
     df["Poste"] = df["Numéro de compte"].apply(classifier_compte)
 
-    # Construire total par poste
+    # ═══════════════════════════════════════════════════════════
+    # 6. AGRÉGATION PAR POSTE (ACTIF / PASSIF)
+    # ═══════════════════════════════════════════════════════════
     postes = {}
     for _, row in df.iterrows():
         poste = row["Poste"]
         net = row["_net"]
+        
         if poste not in postes:
             postes[poste] = {"actif": 0.0, "passif": 0.0}
+        
+        # Solde positif → Actif
         if net > 0:
             postes[poste]["actif"] += net
+        # Solde négatif → Passif
         elif net < 0:
-            postes[poste]["passif"] += -net
+            postes[poste]["passif"] += abs(net)
 
-    # Construire DataFrame bilan
+    # ═══════════════════════════════════════════════════════════
+    # 7. CONSTRUCTION DU DATAFRAME BILAN
+    # ═══════════════════════════════════════════════════════════
     lignes = []
     for poste, vals in postes.items():
         lignes.append({
@@ -1164,12 +1254,14 @@ def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv", conn_pg=None):
             "Actif (Ar)": vals["actif"],
             "Passif (Ar)": vals["passif"]
         })
+    
     df_bilan = pd.DataFrame(lignes).sort_values(by="Poste").reset_index(drop=True)
 
-    # Totaux
+    # Calcul des totaux
     total_actif = df_bilan["Actif (Ar)"].sum()
     total_passif = df_bilan["Passif (Ar)"].sum()
 
+    # Ligne de total
     totals_row = pd.DataFrame([{
         "Poste": "TOTAL",
         "Actif (Ar)": total_actif,
@@ -1178,58 +1270,125 @@ def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv", conn_pg=None):
     
     df_bilan_numeric = pd.concat([df_bilan, totals_row], ignore_index=True)
 
-    # ✅ Export CSV
-    df_bilan_numeric.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
-    st.success(f"✅ CSV Bilan exporté : {fichier_sortie}")
+    # ═══════════════════════════════════════════════════════════
+    # 8. EXPORT CSV
+    # ═══════════════════════════════════════════════════════════
+    try:
+        df_bilan_numeric.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+        st.success(f"✅ Fichier CSV exporté : `{fichier_sortie}`")
+    except Exception as e:
+        st.error(f"❌ Erreur lors de l'export CSV : {e}")
 
-    # ✅ Insertion PostgreSQL Supabase SANS SUPPRESSION
-    if conn_pg:
+    # ═══════════════════════════════════════════════════════════
+    # 9. INSERTION DANS SUPABASE (AVEC DÉTECTION DE DOUBLONS)
+    # ═══════════════════════════════════════════════════════════
+    if conn_pg and file_hash:
         cursor = None
         try:
             cursor = conn_pg.cursor()
 
-            st.info(f"📊 Insertion du bilan dans Supabase (historique conservé)...")
+            # ───────────────────────────────────────────────────
+            # 9.1. VÉRIFIER SI CE FICHIER A DÉJÀ ÉTÉ TRAITÉ
+            # ───────────────────────────────────────────────────
+            cursor.execute("""
+                SELECT COUNT(*), MAX(date_generation) 
+                FROM bilan 
+                WHERE file_hash = %s
+            """, (file_hash,))
+            
+            result = cursor.fetchone()
+            count_existing = result[0] if result else 0
+            last_date = result[1] if result and result[1] else None
 
-            # ✅ INSERTION DIRECTE sans DELETE
-            nouvelles_entrees = []
-            for _, row in df_bilan_numeric.iterrows():
-                nouvelles_entrees.append((
-                    str(row["Poste"]),
-                    float(row["Actif (Ar)"]) if row["Actif (Ar)"] != 0 else 0.0,
-                    float(row["Passif (Ar)"]) if row["Passif (Ar)"] != 0 else 0.0,
-                    pd.Timestamp.now()  # date_generation avec heure précise
-                ))
+            # ───────────────────────────────────────────────────
+            # 9.2. FICHIER DÉJÀ TRAITÉ → BLOQUER L'INSERTION
+            # ───────────────────────────────────────────────────
+            if count_existing > 0:
+                st.warning(f"⚠️ **Ce fichier a déjà été analysé**")
+                st.info(f"📅 Première analyse : {last_date}")
+                st.info(f"📊 {count_existing} enregistrements existants pour ce fichier")
+                st.info("✅ Aucune insertion effectuée (doublons évités)")
+                
+                # Afficher un aperçu des données existantes
+                cursor.execute("""
+                    SELECT "Poste", "Actif (Ar)", "Passif (Ar)"
+                    FROM bilan 
+                    WHERE file_hash = %s
+                    ORDER BY "Poste"
+                """, (file_hash,))
+                
+                existing_data = cursor.fetchall()
+                st.write("**Données existantes :**")
+                df_existing = pd.DataFrame(
+                    existing_data, 
+                    columns=["Poste", "Actif (Ar)", "Passif (Ar)"]
+                )
+                st.dataframe(df_existing)
 
-            execute_values(
-                cursor,
-                """
-                INSERT INTO bilan 
-                ("Poste", "Actif (Ar)", "Passif (Ar)", date_generation)
-                VALUES %s
-                """,
-                nouvelles_entrees
-            )
+            # ───────────────────────────────────────────────────
+            # 9.3. NOUVEAU FICHIER → INSERTION
+            # ───────────────────────────────────────────────────
+            else:
+                st.info(f"📊 Nouveau fichier détecté. Insertion dans Supabase...")
 
-            conn_pg.commit()
+                nouvelles_entrees = []
+                date_aujourd_hui = pd.Timestamp.now().date()
+                
+                for _, row in df_bilan_numeric.iterrows():
+                    nouvelles_entrees.append((
+                        str(row["Poste"]),
+                        float(row["Actif (Ar)"]) if row["Actif (Ar)"] != 0 else 0.0,
+                        float(row["Passif (Ar)"]) if row["Passif (Ar)"] != 0 else 0.0,
+                        date_aujourd_hui,  # date_generation (DATE)
+                        file_hash  # Hash unique du fichier
+                    ))
 
-            # Compter total en base
-            cursor.execute("SELECT COUNT(*) FROM bilan")
-            total = cursor.fetchone()[0]
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO bilan 
+                    ("Poste", "Actif (Ar)", "Passif (Ar)", date_generation, file_hash)
+                    VALUES %s
+                    """,
+                    nouvelles_entrees
+                )
 
-            st.success(f"✅ Bilan inséré dans Supabase → Total bilans historisés : {total}")
+                conn_pg.commit()
+
+                # ───────────────────────────────────────────────
+                # 9.4. STATISTIQUES POST-INSERTION
+                # ───────────────────────────────────────────────
+                cursor.execute("SELECT COUNT(*) FROM bilan")
+                total_enregistrements = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(DISTINCT file_hash) FROM bilan WHERE file_hash IS NOT NULL")
+                nb_fichiers_uniques = cursor.fetchone()[0]
+
+                st.success(f"✅ **Bilan inséré avec succès dans Supabase**")
+                st.success(f"📊 Total : **{total_enregistrements}** enregistrements | **{nb_fichiers_uniques}** fichiers uniques")
 
         except Exception as e:
             conn_pg.rollback()
-            st.error(f"❌ Erreur PostgreSQL Bilan : {e}")
+            st.error(f"❌ **Erreur PostgreSQL lors de l'insertion du bilan :**")
+            st.error(f"```{str(e)}```")
             import traceback
-            st.error(traceback.format_exc())
+            st.error(f"```{traceback.format_exc()}```")
         
         finally:
             if cursor:
                 cursor.close()
 
-    # Mise en forme pour affichage
+    elif conn_pg and not file_hash:
+        st.warning("⚠️ Impossible de calculer le hash du fichier.")
+        st.warning("⚠️ Insertion annulée pour éviter les doublons potentiels.")
+        st.info("💡 Vérifiez que votre fichier contient les colonnes nécessaires.")
+
+    # ═══════════════════════════════════════════════════════════
+    # 10. MISE EN FORME POUR AFFICHAGE
+    # ═══════════════════════════════════════════════════════════
     df_bilan_aff = df_bilan_numeric.copy()
+    
+    # Formater les montants avec séparateurs de milliers
     df_bilan_aff["Actif (Ar)"] = df_bilan_aff["Actif (Ar)"].apply(
         lambda x: f"{int(round(x)):,}".replace(",", " ") + " Ar" if x != 0 else ""
     )
@@ -1237,7 +1396,84 @@ def generer_bilan(df_balance_brut, fichier_sortie="bilan.csv", conn_pg=None):
         lambda x: f"{int(round(x)):,}".replace(",", " ") + " Ar" if x != 0 else ""
     )
 
+    # ═══════════════════════════════════════════════════════════
+    # 11. RETOUR DES RÉSULTATS
+    # ═══════════════════════════════════════════════════════════
     return df_bilan_aff, total_actif, total_passif
+
+
+# ═══════════════════════════════════════════════════════════════
+# FONCTION BONUS : AFFICHER L'HISTORIQUE DES FICHIERS
+# ═══════════════════════════════════════════════════════════════
+def afficher_historique_bilans(conn_pg):
+    """
+    Affiche l'historique des fichiers uniques analysés avec leurs statistiques.
+    
+    Parameters:
+    -----------
+    conn_pg : psycopg2.connection
+        Connexion PostgreSQL/Supabase
+    """
+    if not conn_pg:
+        st.warning("⚠️ Pas de connexion à la base de données")
+        return
+    
+    cursor = None
+    try:
+        cursor = conn_pg.cursor()
+        
+        # Récupérer les statistiques par fichier
+        cursor.execute("""
+            SELECT 
+                file_hash,
+                COUNT(*) as nb_lignes,
+                MIN(date_generation) as premiere_analyse,
+                MAX(date_generation) as derniere_analyse,
+                SUM("Actif (Ar)") as total_actif,
+                SUM("Passif (Ar)") as total_passif
+            FROM bilan
+            WHERE file_hash IS NOT NULL
+            GROUP BY file_hash
+            ORDER BY derniere_analyse DESC
+        """)
+        
+        resultats = cursor.fetchall()
+        
+        if not resultats:
+            st.info("ℹ️ Aucun fichier analysé pour le moment")
+            return
+        
+        st.subheader(f"📂 Historique des fichiers analysés ({len(resultats)} fichiers)")
+        
+        for idx, (hash_val, nb, premiere, derniere, actif, passif) in enumerate(resultats, 1):
+            with st.expander(f"📄 Fichier #{idx} - {hash_val[:12]}... (analysé le {premiere})"):
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Nombre de lignes", nb)
+                with col2:
+                    st.metric("Total Actif", f"{int(actif):,}".replace(",", " ") + " Ar")
+                with col3:
+                    st.metric("Total Passif", f"{int(passif):,}".replace(",", " ") + " Ar")
+                
+                # Afficher le détail
+                cursor.execute("""
+                    SELECT "Poste", "Actif (Ar)", "Passif (Ar)"
+                    FROM bilan
+                    WHERE file_hash = %s
+                    ORDER BY "Poste"
+                """, (hash_val,))
+                
+                detail = cursor.fetchall()
+                df_detail = pd.DataFrame(detail, columns=["Poste", "Actif (Ar)", "Passif (Ar)"])
+                st.dataframe(df_detail, use_container_width=True)
+    
+    except Exception as e:
+        st.error(f"❌ Erreur lors de la récupération de l'historique : {e}")
+    
+    finally:
+        if cursor:
+            cursor.close()
 def generer_compte_resultat(df_balance, fichier_sortie="compte_resultat.csv", conn_pg=None):
     """
     Génère un compte de résultat simplifié (Charges / Produits).
