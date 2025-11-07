@@ -951,30 +951,30 @@ def pdf_image_to_df(file):
     return df
 
 
-def rapprochement_bancaire(df_journal, df_releve, seuil_jours=3, seuil_montant=100):
-    df_journal = df_journal.copy()
-    df_releve = df_releve.copy()
-    df_journal["Date"] = pd.to_datetime(df_journal["Date"], errors="coerce").dt.date
-    df_journal["Montant"] = df_journal.get("Débit (Ar)", 0) - df_journal.get("Crédit (Ar)", 0)
-    df_journal["Statut"] = "Non rapproché"
-    df_releve["Statut"] = "Non rapproché"
+# def rapprochement_bancaire(df_journal, df_releve, seuil_jours=3, seuil_montant=100):
+#     df_journal = df_journal.copy()
+#     df_releve = df_releve.copy()
+#     df_journal["Date"] = pd.to_datetime(df_journal["Date"], errors="coerce").dt.date
+#     df_journal["Montant"] = df_journal.get("Débit (Ar)", 0) - df_journal.get("Crédit (Ar)", 0)
+#     df_journal["Statut"] = "Non rapproché"
+#     df_releve["Statut"] = "Non rapproché"
 
-    for i, row_j in df_journal.iterrows():
-        for j, row_r in df_releve.iterrows():
-            if row_r["Statut"] == "Rapproché":
-                continue
-            date_ok = abs((row_j["Date"] - row_r["Date"]).days) <= seuil_jours
-            montant_ok = abs(row_j["Montant"] - row_r["Montant"]) <= seuil_montant
-            if date_ok and montant_ok:
-                df_journal.at[i, "Statut"] = "Rapproché"
-                df_releve.at[j, "Statut"] = "Rapproché"
-                break
+#     for i, row_j in df_journal.iterrows():
+#         for j, row_r in df_releve.iterrows():
+#             if row_r["Statut"] == "Rapproché":
+#                 continue
+#             date_ok = abs((row_j["Date"] - row_r["Date"]).days) <= seuil_jours
+#             montant_ok = abs(row_j["Montant"] - row_r["Montant"]) <= seuil_montant
+#             if date_ok and montant_ok:
+#                 df_journal.at[i, "Statut"] = "Rapproché"
+#                 df_releve.at[j, "Statut"] = "Rapproché"
+#                 break
 
-    df_result = pd.concat([
-        df_journal[["Date", "Libellé", "Montant", "Statut"]],
-        df_releve.rename(columns={"Libellé":"Libellé_releve"})[["Date","Libellé_releve","Montant","Statut"]]
-    ], axis=1)
-    return df_result
+#     df_result = pd.concat([
+#         df_journal[["Date", "Libellé", "Montant", "Statut"]],
+#         df_releve.rename(columns={"Libellé":"Libellé_releve"})[["Date","Libellé_releve","Montant","Statut"]]
+#     ], axis=1)
+#     return df_result
 # a partir de ici , y a encore des code a rectifier
 def generer_balance(df_grand_journal, fichier_sortie="balance.csv", conn_pg=None):
     """
@@ -1551,108 +1551,108 @@ def generer_compte_resultat(df_balance, fichier_sortie="compte_resultat.csv", co
     df_cr = pd.DataFrame(data)
 
     return df_cr, total_charges, total_produits, resultat_net
-def generer_annexe(df_grand_livre, fichier_sortie="annexe.csv"):
-    """
-    Génère une annexe simplifiée à partir du grand livre.
-    """
-    if df_grand_livre.empty:
-        return pd.DataFrame()
+# def generer_annexe(df_grand_livre, fichier_sortie="annexe.csv"):
+#     """
+#     Génère une annexe simplifiée à partir du grand livre.
+#     """
+#     if df_grand_livre.empty:
+#         return pd.DataFrame()
     
-    # Immobilisations (comptes 2xx)
-    immobilisations = df_grand_livre[df_grand_livre["Compte"].str.startswith("2")]
-    immobilisations_detail = immobilisations.groupby("Compte").agg({
-        "Débit (Ar)": "sum",
-        "Crédit (Ar)": "sum"
-    }).reset_index()
-    immobilisations_detail["Valeur nette"] = immobilisations_detail["Débit (Ar)"] - immobilisations_detail["Crédit (Ar)"]
+#     # Immobilisations (comptes 2xx)
+#     immobilisations = df_grand_livre[df_grand_livre["Compte"].str.startswith("2")]
+#     immobilisations_detail = immobilisations.groupby("Compte").agg({
+#         "Débit (Ar)": "sum",
+#         "Crédit (Ar)": "sum"
+#     }).reset_index()
+#     immobilisations_detail["Valeur nette"] = immobilisations_detail["Débit (Ar)"] - immobilisations_detail["Crédit (Ar)"]
 
-    # Clients (411) et Fournisseurs (401)
-    clients = df_grand_livre[df_grand_livre["Compte"].str.startswith("411")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
-    fournisseurs = df_grand_livre[df_grand_livre["Compte"].str.startswith("401")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
+#     # Clients (411) et Fournisseurs (401)
+#     clients = df_grand_livre[df_grand_livre["Compte"].str.startswith("411")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
+#     fournisseurs = df_grand_livre[df_grand_livre["Compte"].str.startswith("401")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
 
-    # Provisions (compte 15xx)
-    provisions = df_grand_livre[df_grand_livre["Compte"].str.startswith("15")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
+#     # Provisions (compte 15xx)
+#     provisions = df_grand_livre[df_grand_livre["Compte"].str.startswith("15")].groupby("Compte").agg({"Solde": "sum"}).reset_index()
 
-    # Export CSV
-    # with pd.ExcelWriter(fichier_sortie) as writer:
-    #     immobilisations_detail.to_excel(writer, sheet_name="Immobilisations", index=False)
-    #     clients.to_excel(writer, sheet_name="Clients", index=False)
-    #     fournisseurs.to_excel(writer, sheet_name="Fournisseurs", index=False)
-    #     provisions.to_excel(writer, sheet_name="Provisions", index=False)
-    # Concaténer tout dans un seul DataFrame
-    df_annexe = pd.concat([immobilisations, clients, fournisseurs, provisions], ignore_index=True)
+#     # Export CSV
+#     # with pd.ExcelWriter(fichier_sortie) as writer:
+#     #     immobilisations_detail.to_excel(writer, sheet_name="Immobilisations", index=False)
+#     #     clients.to_excel(writer, sheet_name="Clients", index=False)
+#     #     fournisseurs.to_excel(writer, sheet_name="Fournisseurs", index=False)
+#     #     provisions.to_excel(writer, sheet_name="Provisions", index=False)
+#     # Concaténer tout dans un seul DataFrame
+#     df_annexe = pd.concat([immobilisations, clients, fournisseurs, provisions], ignore_index=True)
 
-    # Sauvegarde CSV
-    df_annexe.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+#     # Sauvegarde CSV
+#     df_annexe.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
     
-    return {
-        "Immobilisations": immobilisations_detail,
-        "Clients": clients,
-        "Fournisseurs": fournisseurs,
-        "Provisions": provisions
-    }
+#     return {
+#         "Immobilisations": immobilisations_detail,
+#         "Clients": clients,
+#         "Fournisseurs": fournisseurs,
+#         "Provisions": provisions
+#     }
 
-def generer_amortissement(df_grand_journal, fichier_sortie="amortissement.csv", duree_defaut=5):
-    """
-    Génère automatiquement un plan d’amortissement linéaire
-    pour toutes les factures d’immobilisations (classe 2).
-    - duree_defaut = 5 ans si la durée n’est pas précisée
-    """
-    if df_grand_journal.empty:
-        return pd.DataFrame()
+# def generer_amortissement(df_grand_journal, fichier_sortie="amortissement.csv", duree_defaut=5):
+#     """
+#     Génère automatiquement un plan d’amortissement linéaire
+#     pour toutes les factures d’immobilisations (classe 2).
+#     - duree_defaut = 5 ans si la durée n’est pas précisée
+#     """
+#     if df_grand_journal.empty:
+#         return pd.DataFrame()
 
-    # Nettoyer colonnes numériques
-    for col in ["Débit (Ar)", "Crédit (Ar)"]:
-        df_grand_journal[col] = (
-            df_grand_journal[col].astype(str)
-            .str.replace(r"[^\d\-,.]", "", regex=True)
-            .str.replace(",", ".", regex=False)
-        )
-        df_grand_journal[col] = pd.to_numeric(df_grand_journal[col], errors="coerce").fillna(0)
+#     # Nettoyer colonnes numériques
+#     for col in ["Débit (Ar)", "Crédit (Ar)"]:
+#         df_grand_journal[col] = (
+#             df_grand_journal[col].astype(str)
+#             .str.replace(r"[^\d\-,.]", "", regex=True)
+#             .str.replace(",", ".", regex=False)
+#         )
+#         df_grand_journal[col] = pd.to_numeric(df_grand_journal[col], errors="coerce").fillna(0)
 
-    # Filtrer immobilisations (comptes 2xxx en Débit)
+#     # Filtrer immobilisations (comptes 2xxx en Débit)
     
-            # Si compte 2xxx
-    df_immo = df_grand_journal[df_grand_journal["Compte"].astype(str).str.startswith("2")].copy()
+#             # Si compte 2xxx
+#     df_immo = df_grand_journal[df_grand_journal["Compte"].astype(str).str.startswith("2")].copy()
     
-            # Si n'importe quel compte
-    # df_immo = df_grand_journal[df_grand_journal['Compte'].str.match(r'^\d+$')].copy()
-    # Vérification debug
-    st.write("Nombre de lignes immobilisations :", df_immo.shape[0])
+#             # Si n'importe quel compte
+#     # df_immo = df_grand_journal[df_grand_journal['Compte'].str.match(r'^\d+$')].copy()
+#     # Vérification debug
+#     st.write("Nombre de lignes immobilisations :", df_immo.shape[0])
     
-    plans = []
-    for _, row in df_immo.iterrows():
-        date_acq = pd.to_datetime(row["Date"], errors="coerce")
-        montant = row["Débit (Ar)"] if row["Débit (Ar)"] > 0 else row["Crédit (Ar)"]
+#     plans = []
+#     for _, row in df_immo.iterrows():
+#         date_acq = pd.to_datetime(row["Date"], errors="coerce")
+#         montant = row["Débit (Ar)"] if row["Débit (Ar)"] > 0 else row["Crédit (Ar)"]
 
-        if pd.isna(date_acq) or montant <= 0:
-            continue
+#         if pd.isna(date_acq) or montant <= 0:
+#             continue
 
-        duree = duree_defaut
-        annuite = montant / duree
+#         duree = duree_defaut
+#         annuite = montant / duree
 
-        for i in range(1, duree + 1):
-            annee = date_acq.year + i - 1
-            plans.append({
-                "Référence": row.get("Référence", ""),
-                "Date acquisition": date_acq.date(),
-                "Compte immobilisation": row["Compte"], 
-                "Montant acquisition": montant,
-                "Année": annee,
-                "Durée (ans)": duree,
-                "Annuité": round(annuite, 2),
-                "Cumul amortissement": round(annuite * i, 2),
-                "Valeur nette comptable": round(montant - annuite * i, 2)
-            })
+#         for i in range(1, duree + 1):
+#             annee = date_acq.year + i - 1
+#             plans.append({
+#                 "Référence": row.get("Référence", ""),
+#                 "Date acquisition": date_acq.date(),
+#                 "Compte immobilisation": row["Compte"], 
+#                 "Montant acquisition": montant,
+#                 "Année": annee,
+#                 "Durée (ans)": duree,
+#                 "Annuité": round(annuite, 2),
+#                 "Cumul amortissement": round(annuite * i, 2),
+#                 "Valeur nette comptable": round(montant - annuite * i, 2)
+#             })
 
-    # Créer le DataFrame final
-    df_amort = pd.DataFrame(plans)
+#     # Créer le DataFrame final
+#     df_amort = pd.DataFrame(plans)
 
-    # Sauvegarde si non vide
-    if not df_amort.empty:
-        df_amort.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
+#     # Sauvegarde si non vide
+#     if not df_amort.empty:
+#         df_amort.to_csv(fichier_sortie, index=False, encoding="utf-8-sig")
 
-    return df_amort 
+#     return df_amort 
 
 # ==========================
 # INTERFACE STREAMLIT
@@ -1755,34 +1755,34 @@ if st.button("Traiter") and fichiers:
             mime="text/csv"
         )
 
-    st.markdown("<h4>Rapprochement bancaire</h4>", unsafe_allow_html=True)
+    # st.markdown("<h4>Rapprochement bancaire</h4>", unsafe_allow_html=True)
 
-        # Upload Grand Livre
-    uploaded_journal = st.file_uploader("Importer Grand Livre (CSV ou Excel)", type=["csv","xlsx"])
-    # Upload Relevé bancaire
-    uploaded_releve = st.file_uploader("Importer Relevé bancaire (CSV, Excel ou PDF/image)", type=["csv","xlsx","pdf","png","jpg","jpeg"])
+    #     # Upload Grand Livre
+    # uploaded_journal = st.file_uploader("Importer Grand Livre (CSV ou Excel)", type=["csv","xlsx"])
+    # # Upload Relevé bancaire
+    # uploaded_releve = st.file_uploader("Importer Relevé bancaire (CSV, Excel ou PDF/image)", type=["csv","xlsx","pdf","png","jpg","jpeg"])
 
-    df_journal, df_releve = None, None
+    # df_journal, df_releve = None, None
 
-    if uploaded_journal:
-        if uploaded_journal.name.endswith(".csv"):
-            df_journal = pd.read_csv(uploaded_journal)
-        else:
-            df_journal = pd.read_excel(uploaded_journal)
+    # if uploaded_journal:
+    #     if uploaded_journal.name.endswith(".csv"):
+    #         df_journal = pd.read_csv(uploaded_journal)
+    #     else:
+    #         df_journal = pd.read_excel(uploaded_journal)
 
-    if uploaded_releve:
-        if uploaded_releve.name.endswith((".csv", ".xlsx")):
-            df_releve = pd.read_csv(uploaded_releve) if uploaded_releve.name.endswith(".csv") else pd.read_excel(uploaded_releve)
-            df_releve.rename(columns={"Débit (Ar)":"Montant","Crédit (Ar)":"Montant"}, inplace=True)
-        else:
-            df_releve = pdf_image_to_df(uploaded_releve)
+    # if uploaded_releve:
+    #     if uploaded_releve.name.endswith((".csv", ".xlsx")):
+    #         df_releve = pd.read_csv(uploaded_releve) if uploaded_releve.name.endswith(".csv") else pd.read_excel(uploaded_releve)
+    #         df_releve.rename(columns={"Débit (Ar)":"Montant","Crédit (Ar)":"Montant"}, inplace=True)
+    #     else:
+    #         df_releve = pdf_image_to_df(uploaded_releve)
 
 
-    # Lancer rapprochement
-    if df_journal is not None and df_releve is not None:
-        df_result = rapprochement_bancaire(df_journal, df_releve)
-        st.dataframe(df_result)
-        st.download_button("⬇️ Télécharger le rapprochement", df_result.to_csv(index=False, encoding="utf-8-sig"), "rapprochement.csv", "text/csv")
+    # # Lancer rapprochement
+    # if df_journal is not None and df_releve is not None:
+    #     df_result = rapprochement_bancaire(df_journal, df_releve)
+    #     st.dataframe(df_result)
+    #     st.download_button("⬇️ Télécharger le rapprochement", df_result.to_csv(index=False, encoding="utf-8-sig"), "rapprochement.csv", "text/csv")
 
 
 
@@ -1863,39 +1863,39 @@ if st.button("Traiter") and fichiers:
         st.info(" Aucun compte de résultat généré. Vérifiez vos données.")
 
 
-    # Supposons que tu as déjà généré ton annexe
-    annexe = generer_annexe(df_grand_livre)
+    # # Supposons que tu as déjà généré ton annexe
+    # annexe = generer_annexe(df_grand_livre)
 
-    # Affichage par onglet pour chaque section
-    tabs = st.tabs(["Immobilisations", "Clients", "Fournisseurs", "Provisions"])
+    # # Affichage par onglet pour chaque section
+    # tabs = st.tabs(["Immobilisations", "Clients", "Fournisseurs", "Provisions"])
 
-    with tabs[0]:
-        st.markdown("<h4>Immobilisations</h4>", unsafe_allow_html=True)
-        st.dataframe(annexe["Immobilisations"])
+    # with tabs[0]:
+    #     st.markdown("<h4>Immobilisations</h4>", unsafe_allow_html=True)
+    #     st.dataframe(annexe["Immobilisations"])
 
-    with tabs[1]:
-        st.markdown("<h4>Clients</h4>", unsafe_allow_html=True)
-        st.dataframe(annexe["Clients"])
+    # with tabs[1]:
+    #     st.markdown("<h4>Clients</h4>", unsafe_allow_html=True)
+    #     st.dataframe(annexe["Clients"])
 
-    with tabs[2]:
-        st.markdown("<h4>Fournisseurs</h4>", unsafe_allow_html=True)
-        st.dataframe(annexe["Fournisseurs"])
+    # with tabs[2]:
+    #     st.markdown("<h4>Fournisseurs</h4>", unsafe_allow_html=True)
+    #     st.dataframe(annexe["Fournisseurs"])
 
-    with tabs[3]:
-        st.markdown("<h4>Provisions</h4>", unsafe_allow_html=True)
-        st.dataframe(annexe["Provisions"])
+    # with tabs[3]:
+    #     st.markdown("<h4>Provisions</h4>", unsafe_allow_html=True)
+    #     st.dataframe(annexe["Provisions"])
         
-            # Génération du plan d'amortissement
-        df_amortissement = generer_amortissement(df_grand_livre)
-        st.markdown("<h4>📊 Plan d'Amortissement des Immobilisations</h4>", unsafe_allow_html=True)
-        if df_amortissement is not None and not df_amortissement.empty:
-        # Affichage complet dans un seul tableau
-            st.dataframe(df_amortissement)
-            st.download_button(
-                "⬇️ Télécharger le Plan d'Amortissement",
-                data=df_amortissement.to_csv(index=False, encoding="utf-8-sig"),
-                file_name="amortissement.csv",
-                mime="text/csv"
-            )
-        else:
-            st.info("Aucun amortissement généré.")
+    #         # Génération du plan d'amortissement
+    #     df_amortissement = generer_amortissement(df_grand_livre)
+    #     st.markdown("<h4>📊 Plan d'Amortissement des Immobilisations</h4>", unsafe_allow_html=True)
+    #     if df_amortissement is not None and not df_amortissement.empty:
+    #     # Affichage complet dans un seul tableau
+    #         st.dataframe(df_amortissement)
+    #         st.download_button(
+    #             "⬇️ Télécharger le Plan d'Amortissement",
+    #             data=df_amortissement.to_csv(index=False, encoding="utf-8-sig"),
+    #             file_name="amortissement.csv",
+    #             mime="text/csv"
+    #         )
+    #     else:
+    #         st.info("Aucun amortissement généré.")
